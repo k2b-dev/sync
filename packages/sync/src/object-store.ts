@@ -78,6 +78,9 @@ export type ObjectStore = {
 // Object store factory
 // ==========================
 
+/** @nats-io/obj default max_chunk_size — one chunk is one NATS message. */
+const OBJECT_CHUNK_BYTES = 128 * 1024;
+
 export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfig): ObjectStore => {
   const identity = resourceIdentity(runtime.namespace, "object-store", config.id);
   const owner = config.owner ?? runtime.application;
@@ -113,6 +116,7 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
       config.maxObjectBytes,
     ]),
     natsNames: [`OBJ_${bucket}`],
+    maxMessageBytes: OBJECT_CHUNK_BYTES,
     provision: async (ctx: ProvisionContext) => {
       os = await ensureObjectStore(ctx, identity, owner, bucket, {
         storage,

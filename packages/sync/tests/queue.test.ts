@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync } from "../src/sync.ts";
 import type { Sync } from "../src/sync.ts";
-import { PayloadTooLargeError } from "../src/errors.ts";
+import { PayloadTooLargeError, UnsupportedServerError } from "../src/errors.ts";
+import { DLQ_HEADROOM_BYTES } from "../src/types.ts";
 import { connectToCluster, uniqueName } from "./cluster.ts";
 import { cleanupNamespaces, testNamespace, waitFor } from "./helpers.ts";
 
@@ -341,4 +342,20 @@ describe("batch ttl regression", () => {
     expect(seen).toEqual([]);
     await w.drain();
   }, 15_000);
+});
+
+describe("server payload guard", () => {
+  test("a payload limit above the server max_payload is refused at ready()", async () => {
+    const serverMax = nc.info!.max_payload;
+    const strict = createSync({ connection: nc, namespace, application: "tests" });
+    // The dead-letter envelope adds headroom: a limit that fits alone but not with headroom is refused too.
+    strict.queue<Task>({ id: "too-large", maxPayloadBytes: serverMax - DLQ_HEADROOM_BYTES + 1 });
+    await expect(strict.ready()).rejects.toBeInstanceOf(UnsupportedServerError);
+    await strict.drain({ timeoutMs: 1_000 });
+
+    const fits = createSync({ connection: nc, namespace, application: "tests" });
+    fits.queue<Task>({ id: "fits", maxPayloadBytes: serverMax - 8_192 });
+    await fits.ready();
+    await fits.drain({ timeoutMs: 1_000 });
+  }, 20_000);
 });

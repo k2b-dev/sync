@@ -470,3 +470,71 @@ describe("run lifecycle events", () => {
     await observed.drain({ timeoutMs: 1_000 });
   }, 30_000);
 });
+
+describe("sequences and cursor helpers", () => {
+  test("events expose the stream sequence; cursorSequence/cursorAt round-trip and stay resource-bound", async () => {
+    const topic = sync.topic<Event>(topicConfig("sequences"));
+    const other = sync.topic<Event>(topicConfig("sequences-other"));
+    const first = await topic.publish({ data: { n: 1 } });
+    const second = await topic.publish({ data: { n: 2 } });
+    const events = await collect(topic.replay());
+    expect(events.map((e) => e.sequence)).toEqual([first.streamSequence, second.streamSequence]);
+    expect(events[1]!.sequence).toBeGreaterThan(events[0]!.sequence);
+    expect(topic.cursorSequence(second.cursor)).toBe(second.streamSequence);
+    expect(topic.cursorAt(first.streamSequence)).toBe(first.cursor);
+    // A persisted sequence resumes exactly like the cursor it came from.
+    const resumed = await collect(topic.replay({ after: topic.cursorAt(first.streamSequence) }));
+    expect(resumed.map((e) => e.data.n)).toEqual([2]);
+    expect(() => other.cursorSequence(first.cursor)).toThrow(CursorMismatchError);
+    expect(() => topic.cursorSequence("1699999999-0")).toThrow(CursorMismatchError);
+    expect(() => topic.cursorAt(-1)).toThrow(RangeError);
+  }, 20_000);
+
+  test("hub() is memoized per tenant until closed", async () => {
+    const topic = sync.topic<Event>(topicConfig("hub-memo"));
+    const a = topic.hub();
+    expect(topic.hub()).toBe(a);
+    expect(topic.hub({ tenantId: "default" })).toBe(a);
+    const b = topic.hub({ tenantId: "t2" });
+    expect(b).not.toBe(a);
+    expect(topic.hub({ tenantId: "t2" })).toBe(b);
+    a.close();
+    expect(topic.hub()).not.toBe(a);
+    b.close();
+    topic.hub().close();
+  });
+
+  test("a hub whose follower died is retired: subscribers fail loudly and hub() re-creates it", async () => {
+    const topic = sync.topic<Event>(topicConfig("hub-dead"));
+    const last = await topic.publish({ data: { n: 1 } });
+    const dead = topic.hub();
+    let error: Error | null = null;
+    const run = (async () => {
+      try {
+        for await (const _ of dead.subscribe()) {
+          // live-only; never expected to yield
+        }
+      } catch (err) {
+        error = err as Error;
+      }
+    })();
+    await Bun.sleep(500); // follower is tailing
+    // Retention removes everything the follower is anchored to → RetentionGapError mid-follow.
+    const jsm = await jetstreamManager(nc);
+    for await (const info of jsm.streams.list()) {
+      if (info.config.metadata?.["sync.id"] === "hub-dead" && !info.config.name.includes("D_")) {
+        await jsm.streams.purge(info.config.name, { seq: Number(last.streamSequence) + 100 });
+      }
+    }
+    await run;
+    expect(error).toBeInstanceOf(RetentionGapError);
+    await expect(collect(dead.subscribe(), 1)).rejects.toBeInstanceOf(RetentionGapError); // late subscriber, same dead hub
+    const fresh = topic.hub();
+    expect(fresh).not.toBe(dead);
+    const received = collect(fresh.subscribe(), 1);
+    await Bun.sleep(300);
+    await topic.publish({ data: { n: 2 } });
+    expect((await received).map((e) => e.data.n)).toEqual([2]);
+    fresh.close();
+  }, 30_000);
+});

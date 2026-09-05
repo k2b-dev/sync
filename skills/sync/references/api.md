@@ -2,7 +2,7 @@
 
 All primitives are created from a `Sync` instance and share these conventions:
 
-- Factories perform no I/O; `await handle.ready()` (or the first operation) waits for provisioning.
+- Factories perform no I/O; `await handle.ready()` (or the first operation) waits for provisioning. Provisioning refuses (`UnsupportedServerError`) any `maxPayloadBytes`/`maxValueBytes`/`maxPageBytes` the connected server's `max_payload` cannot carry (headers count too — keep a small margin); size the server for the largest publish.
 - `tenantId?` defaults to `"default"`. Ids, tenant ids, keys, and consumer names are non-empty UTF-8 strings ≤ 96 bytes.
 - `meta?: Record<string, JsonValue>` travels with messages/events.
 - `Worker` handles: `{ active, capacity, stop(), drain({ timeoutMs? }), [Symbol.asyncDispose] }`.
@@ -126,18 +126,28 @@ await t.latestCursor({ tenantId? });        // TopicCursor | null, per tenant
 for await (const e of t.live({ tenantId?, signal? })) {}    // broadcast, no cursor/replay
 for await (const e of t.replay({ tenantId?, after?, until?, signal? })) {} // to head-at-start
 for await (const e of t.follow({ tenantId?, after?, signal? })) {}         // stays open
-// events: { data, eventId, cursor, tenantId, orderingKey?, publishedAt, meta? }
+// events: { data, eventId, cursor, sequence, tenantId, orderingKey?, publishedAt, meta? }
+// sequence = the stream sequence behind the cursor: monotonic per topic, safe to persist
+// as a number and compare; live() events carry neither cursor nor sequence.
 // after below retention → RetentionGapError (also for a fresh process({start:{after}}) consumer);
 // error.resumeAfter is the cursor that resumes from the first retained event.
 // foreign cursor → CursorMismatchError; mid-follow retention loss → RetentionGapError.
 // tenantId is a client-side filter: replay/follow stream the WHOLE topic from
 // the server — prefer one topic per tenant or process() for high volume.
 
-const h = t.hub({ tenantId? });  // ONE shared follow() for many local subscribers
+const h = t.hub({ tenantId? });  // ONE shared follow() for many local subscribers;
+                                 // memoized per tenant per topic handle until close()
 for await (const e of h.subscribe({ after?, bufferLimit? /* default 1024 */, signal? })) {}
 // catch-up replay splices into the live tail (seq-deduped); slow subscribers end
 // with RetentionGapError (resumeAfter = last delivered cursor) — resubscribe.
+// No explicit "caught up" signal: for a deterministic boundary run
+// replay({ after, until: latestCursor() }) first, then subscribe({ after: until }).
 h.close();
+
+t.cursorSequence(cursor);   // number — CursorMismatchError for foreign/invalid cursors
+t.cursorAt(sequence);       // TopicCursor for a persisted sequence (never fabricate cursor strings);
+                            // cursorAt(0) = "before the first event" (after is exclusive) — a BIGINT
+                            // column defaulting to 0 replays from the start
 
 await t.process({
   consumer,                       // same name competes, different names = independent cursors
@@ -173,6 +183,8 @@ await p.reconcile();                    // { requeued } — re-enqueue wake-ups 
 ```
 
 Cursor advances only after every page item is checkpointed; a crash repeats only items finished after their last confirmed checkpoint.
+
+Observe events: `pump_run_started { key }` once per created/restarted run, `pump_run_settled { key, status: completed|failed|canceled, dispatched, failureCount, durationMs, error? }` exactly once per run at its terminal transition (emitted by whichever process performed it, including `cancel()`). `durationMs` is measured from `start()` and includes queued/waiting time, unlike `handler_settled.durationMs` (handler time only).
 
 ## scheduler
 
@@ -269,6 +281,10 @@ const value = await retry<T>({
 expBackoff(attempt, { baseMs?, maxMs?, jitter? });
 isRetryableTransportError(error);   // network-vocabulary heuristics (no Redis codes in v6)
 ```
+
+## Events
+
+`observe` / `sync.events()` deliver `SyncEvent { type, at, resource?, kind?, detail?, error? }`. Types: `connection`, `ready`, `resource_verified`, `resource_drifted`, `worker_started`, `worker_stopped`, `handler_started` / `handler_settled` (queue/job/topic/scheduler runs: `{ id, key?, attempt, status: success|retry|dead_letter, durationMs }`), `handler_error`, `redelivery`, `dead_letter`, `lock_lost`, `schedule_tick`, `schedule_misfire`, `pump_recovered`, `pump_run_started` / `pump_run_settled`, `object_error`, `watch_resync_required`, `drain_timeout`. Events carry ids, keys, and statuses — never handler results or payloads. Observers cannot block or alter transport work; slow `events()` readers drop events.
 
 ## Errors
 

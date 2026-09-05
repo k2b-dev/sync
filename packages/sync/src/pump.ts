@@ -91,6 +91,8 @@ type PumpRecord<Input, Cursor, Item extends PumpItem> = {
 };
 
 const TERMINAL: readonly PumpStatus[] = ["completed", "failed", "canceled"];
+/** Bytes a persisted run record may add on top of its page (input, cursor, lease, counters). */
+const RECORD_HEADROOM_BYTES = 8_192;
 
 // ==========================
 // Pump factory
@@ -154,6 +156,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       leaseMs,
     ]),
     natsNames: [`KV_${bucket}`, wakeStream],
+    maxMessageBytes: maxPageBytes + RECORD_HEADROOM_BYTES,
     provision: async (ctx: ProvisionContext) => {
       kv = await ensureKv(ctx, identity, owner, bucket, {
         history: 1,
@@ -239,7 +242,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   ): Promise<number | null> => {
     await getKv();
     record.updatedAt = new Date().toISOString();
-    const bytes = encodeJson(label, record, maxPageBytes + 8_192);
+    const bytes = encodeJson(label, record, maxPageBytes + RECORD_HEADROOM_BYTES);
     const ctx = await runtime.context();
     const ttl = TERMINAL.includes(record.status) ? `${Math.max(1, Math.ceil(terminalMs / 1_000))}s` : undefined;
     return kvCasPut(ctx, bucket, runKey(key), bytes, previousRevision, ttl !== undefined ? { ttl } : {});
@@ -271,6 +274,22 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     createdAt: new Date(record.createdAt),
     updatedAt: new Date(record.updatedAt),
   });
+
+  const emitSettled = (record: PumpRecord<Input, Cursor, Item>): void => {
+    runtime.events.emit({
+      type: "pump_run_settled",
+      resource: config.id,
+      kind: "pump",
+      detail: {
+        key: record.key,
+        status: record.status,
+        dispatched: record.dispatched,
+        failureCount: record.failureCount,
+        durationMs: Math.max(0, Date.now() - Date.parse(record.createdAt)),
+        ...(record.lastError !== undefined ? { error: record.lastError } : {}),
+      },
+    });
+  };
 
   // ==========================
   // Public operations
@@ -310,6 +329,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       const previous = state === null ? (existing !== null ? existing.revision : (await readRunKey(input.key)).lastRevision) : state.lastRevision;
       const revision = await casWrite(input.key, record, previous);
       if (revision !== null) {
+        runtime.events.emit({ type: "pump_run_started", resource: config.id, kind: "pump", detail: { key: input.key } });
         await publishWake(input.key);
         return;
       }
@@ -329,7 +349,10 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       const loaded = await load(input.key);
       if (loaded === null || TERMINAL.includes(loaded.record.status)) return false;
       const record = { ...loaded.record, status: "canceled" as const, lease: undefined };
-      if ((await casWrite(input.key, record, loaded.revision)) !== null) return true;
+      if ((await casWrite(input.key, record, loaded.revision)) !== null) {
+        emitSettled(record);
+        return true;
+      }
     }
     return false;
   };
@@ -463,8 +486,12 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
         return;
       }
       runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: error.message });
-      if (terminal) msg.ack();
-      else msg.nak(backoffMs[Math.min(failureCount - 1, backoffMs.length - 1)]!);
+      if (terminal) {
+        emitSettled(record);
+        msg.ack();
+      } else {
+        msg.nak(backoffMs[Math.min(failureCount - 1, backoffMs.length - 1)]!);
+      }
     };
 
     /** Dispatch remaining page items with bounded concurrency; returns the first error or null. */
@@ -543,6 +570,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
             msg.nak();
             return;
           }
+          emitSettled(record);
           msg.ack();
           return;
         }
@@ -619,6 +647,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       });
       if (!advanced) continue;
       if (record.status === "completed") {
+        emitSettled(record);
         msg.ack();
         return;
       }

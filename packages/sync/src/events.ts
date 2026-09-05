@@ -26,6 +26,8 @@ export type SyncEvent = {
     | "schedule_tick"
     | "schedule_misfire"
     | "pump_recovered"
+    | "pump_run_started" // detail: key
+    | "pump_run_settled" // detail: key, status, dispatched, failureCount, durationMs, error?
     | "object_error"
     | "watch_resync_required"
     | "drain_timeout";

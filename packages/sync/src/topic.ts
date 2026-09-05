@@ -12,6 +12,7 @@ import type { SyncRuntime } from "./runtime.ts";
 import {
   DEFAULT_DEDUPE_WINDOW_MS,
   DEFAULT_MESSAGE_PAYLOAD_BYTES,
+  DLQ_HEADROOM_BYTES,
   DEFAULT_TENANT,
   assertRetention,
   backoffDelayMs,
@@ -42,13 +43,15 @@ export type TopicEvent<T> = {
   data: T;
   eventId: string;
   cursor: TopicCursor;
+  /** Stream sequence behind `cursor` — monotonic per topic, safe to persist and compare numerically. */
+  sequence: number;
   tenantId: string;
   orderingKey?: string;
   publishedAt: Date;
   meta?: MessageMeta;
 };
 
-export type TopicLiveEvent<T> = Omit<TopicEvent<T>, "cursor">;
+export type TopicLiveEvent<T> = Omit<TopicEvent<T>, "cursor" | "sequence">;
 
 export type TopicPublish<T> = {
   data: T;
@@ -112,9 +115,14 @@ export type Topic<T> = {
    * In-process fanout hub: ONE shared follow() feeds any number of local
    * subscribers, each with its own cursor. Built for per-connection tails
    * (WebSocket/SSE) where a follow() per connection would stream the whole
-   * topic once per client.
+   * topic once per client. One hub per tenant per topic handle: repeated
+   * calls return the same hub until it is closed.
    */
   hub(options?: { tenantId?: string }): TopicHub<T>;
+  /** Stream sequence of a cursor issued by this topic (CursorMismatchError otherwise). */
+  cursorSequence(cursor: TopicCursor): number;
+  /** Cursor for a stream sequence of this topic (e.g. one persisted from `TopicEvent.sequence`). */
+  cursorAt(sequence: number): TopicCursor;
   /** Pause delivery for one named durable consumer — global, all pods. */
   pauseConsumer(input: { consumer: string; tenantId?: string; untilMs?: number }): Promise<{ paused: boolean; pauseUntil?: Date }>;
   resumeConsumer(input: { consumer: string; tenantId?: string }): Promise<{ paused: boolean }>;
@@ -202,6 +210,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     owner,
     configKey: JSON.stringify(["topic", config.id, owner, retention, dedupeWindowMs, maxPayloadBytes, replicas]),
     natsNames: [stream, dlqStream],
+    maxMessageBytes: maxPayloadBytes + DLQ_HEADROOM_BYTES,
     provision: async (ctx: ProvisionContext) => {
       await ensureStream(ctx, identity, owner, {
         name: stream,
@@ -249,6 +258,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     data: envelope.data as T,
     eventId: extString(envelope, "eventId") ?? String(seq),
     cursor: cursorOf(identity, seq),
+    sequence: seq,
     tenantId: envelope.tenantId,
     orderingKey: envelope.orderingKey,
     publishedAt: new Date(envelope.publishedAt),
@@ -528,7 +538,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       };
       // Headroom: the transfer adds bookkeeping on top of the original payload
       // and must never be the reason an event cannot be dead-lettered.
-      const bytes = encodeEnvelope(`topic ${config.id} dlq`, dlqEnvelope, maxPayloadBytes + 4_096);
+      const bytes = encodeEnvelope(`topic ${config.id} dlq`, dlqEnvelope, maxPayloadBytes + DLQ_HEADROOM_BYTES);
       await ctx.js.publish(dlqSubject(options.consumer), bytes, {
         msgID: `dlq.${subjectToken(options.consumer, "consumer")}.${eventId}`,
       });
@@ -692,8 +702,12 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     }
   };
 
+  const hubs = new Map<string, TopicHub<T>>();
+
   const hub: Topic<T>["hub"] = (hubOptions = {}) => {
     const tenantId = hubOptions.tenantId ?? DEFAULT_TENANT;
+    const existing = hubs.get(tenantId);
+    if (existing !== undefined) return existing;
     type Sub = {
       buffer: TopicEvent<T>[];
       limit: number;
@@ -708,6 +722,13 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     let followerStarted = false;
     let headSeq = 0;
     let closed = false;
+    /** Set when the shared follower died; the hub is retired and re-created on the next hub() call. */
+    let failure: Error | null = null;
+
+    const retire = (): void => {
+      closed = true;
+      if (hubs.get(tenantId) === created) hubs.delete(tenantId);
+    };
 
     const wake = (sub: Sub): void => {
       sub.notify?.();
@@ -740,11 +761,15 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
             }
           }
         } catch (error) {
-          const failure = asError(error);
+          failure = asError(error);
           for (const sub of subs) {
             sub.failed = failure;
             wake(sub);
           }
+        } finally {
+          // A follower that ended (error or close) must not keep serving a
+          // memoized hub whose subscribers would wait forever.
+          retire();
         }
       })();
     };
@@ -759,6 +784,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       signal?: AbortSignal;
     }): AsyncGenerator<TopicEvent<T>> {
       runtime.assertActive();
+      if (failure !== null) throw failure;
       if (closed || options.signal?.aborted) return;
       const sub: Sub = {
         buffer: [],
@@ -788,8 +814,11 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
             yield event;
           }
         }
-        while (!sub.done && !closed) {
+        while (!sub.done) {
+          // A dead follower must surface as an error even though retiring the
+          // hub also marks it closed; a plain close() ends subscribers quietly.
           if (sub.failed !== null) throw sub.failed;
+          if (closed) return;
           if (sub.overflowed) {
             throw new RetentionGapError(
               cursorOf(identity, sub.lastSeq + 1),
@@ -816,10 +845,10 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       }
     }
 
-    return {
+    const created: TopicHub<T> = {
       subscribe,
       close: () => {
-        closed = true;
+        retire();
         follower.abort();
         for (const sub of subs) {
           sub.done = true;
@@ -827,6 +856,15 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         }
       },
     };
+    hubs.set(tenantId, created);
+    return created;
+  };
+
+  const cursorSequence: Topic<T>["cursorSequence"] = (cursor) => parseCursor(identity, cursor, "cursor");
+
+  const cursorAt: Topic<T>["cursorAt"] = (sequence) => {
+    if (!Number.isSafeInteger(sequence) || sequence < 0) throw new RangeError("sequence must be a non-negative integer");
+    return cursorOf(identity, sequence);
   };
 
   return {
@@ -839,6 +877,8 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     follow,
     process,
     hub,
+    cursorSequence,
+    cursorAt,
     pauseConsumer,
     resumeConsumer,
   };

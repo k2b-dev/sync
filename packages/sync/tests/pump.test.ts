@@ -300,3 +300,54 @@ describe("hardening regressions", () => {
     await worker.drain();
   }, 30_000);
 });
+
+describe("run lifecycle events", () => {
+  test("pump_run_started once per run; pump_run_settled exactly once with the terminal status", async () => {
+    const events: Array<{ type: string; detail?: Record<string, unknown> }> = [];
+    const observed = createSync({
+      connection: nc,
+      namespace,
+      application: "tests",
+      observe: (e) => {
+        if (e.type === "pump_run_started" || e.type === "pump_run_settled") {
+          events.push({ type: e.type, detail: e.detail as Record<string, unknown> });
+        }
+      },
+    });
+    const pump = observed.pump<Input, number, Item>({
+      id: "events",
+      batchSize: 3,
+      retry: { maxAttempts: 2, backoffMs: [100] },
+      pull: pagedPull(3),
+      dispatch: async ({ input, item }) => {
+        if (input.total === 99 && item.key === "item-1") throw new Error("poison item");
+        if (input.total === 1_000) await Bun.sleep(100); // long-running: canceled mid-run below
+      },
+    });
+    const worker = await pump.process({ concurrency: 2 });
+    await pump.start({ key: "ok", input: { total: 5 } });
+    await pump.start({ key: "ok", input: { total: 5 } }); // idempotent — no second started event
+    await pump.start({ key: "bad", input: { total: 99 } });
+    await pump.start({ key: "gone", input: { total: 1_000 } });
+    await waitFor(async () => (await pump.get({ key: "gone" }))?.status === "running", 15_000);
+    expect(await pump.cancel({ key: "gone" })).toBe(true);
+    await waitFor(() => events.filter((e) => e.type === "pump_run_settled").length >= 3, 30_000);
+    await Bun.sleep(300);
+
+    const started = events.filter((e) => e.type === "pump_run_started").map((e) => e.detail?.key);
+    expect(started.toSorted()).toEqual(["bad", "gone", "ok"]);
+    const settledEvents = events.filter((e) => e.type === "pump_run_settled");
+    expect(settledEvents).toHaveLength(3); // exactly one per run, no double settle
+    const settled = new Map(settledEvents.map((e) => [e.detail?.key, e.detail]));
+    expect(settled.get("ok")).toMatchObject({ status: "completed", dispatched: 5, failureCount: 0 });
+    expect(settled.get("bad")).toMatchObject({ status: "failed", failureCount: 2, error: "poison item" });
+    expect(settled.get("gone")).toMatchObject({ status: "canceled" });
+    expect(typeof settled.get("ok")?.durationMs).toBe("number");
+    // Restarting a terminal run is a new run instance: one more started + settled pair.
+    await pump.start({ key: "ok", input: { total: 2 } });
+    await waitFor(() => events.filter((e) => e.type === "pump_run_settled" && e.detail?.key === "ok").length === 2, 15_000);
+    expect(events.filter((e) => e.type === "pump_run_started" && e.detail?.key === "ok")).toHaveLength(2);
+    await worker.drain();
+    await observed.drain({ timeoutMs: 2_000 });
+  }, 45_000);
+});

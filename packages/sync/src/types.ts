@@ -45,6 +45,8 @@ const DEFAULT_DELIVERY: ResolvedDelivery = {
 };
 
 export const DEFAULT_MESSAGE_PAYLOAD_BYTES = 128 * 1024;
+/** Extra bytes a dead-letter envelope may add on top of the payload limit (failure metadata). */
+export const DLQ_HEADROOM_BYTES = 4_096;
 export const DEFAULT_EPHEMERAL_PAYLOAD_BYTES = 4 * 1024;
 export const DEFAULT_DEDUPE_WINDOW_MS = 120_000;
 export const DEFAULT_TENANT = "default";

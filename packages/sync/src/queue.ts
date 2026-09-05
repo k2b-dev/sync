@@ -14,6 +14,7 @@ import type { SyncRuntime } from "./runtime.ts";
 import {
   DEFAULT_DEDUPE_WINDOW_MS,
   DEFAULT_MESSAGE_PAYLOAD_BYTES,
+  DLQ_HEADROOM_BYTES,
   DEFAULT_TENANT,
   assertRetention,
   backoffDelayMs,
@@ -226,6 +227,7 @@ export const createQueueCore = <T, D = T>(
       config.dlqMaxAgeMs ?? null,
     ]),
     natsNames: [stream, dlqStream, ...(config.extraNatsNames ?? [])],
+    maxMessageBytes: maxPayloadBytes + DLQ_HEADROOM_BYTES,
     provision: async (ctx: ProvisionContext) => {
       await config.provisionExtra?.(ctx);
       await ensureStream(ctx, identity, owner, {
@@ -496,7 +498,7 @@ export const createQueueCore = <T, D = T>(
     };
     // Headroom: the transfer adds bookkeeping on top of the original payload
     // and must never be the reason a message cannot be dead-lettered.
-    const bytes = encodeEnvelope(`${label} dlq`, dlqEnvelope, maxPayloadBytes + 4_096);
+    const bytes = encodeEnvelope(`${label} dlq`, dlqEnvelope, maxPayloadBytes + DLQ_HEADROOM_BYTES);
     // The original message ID keys the DLQ dedupe window, so a crash between
     // DLQ publish and source ack repeats the transfer without duplicating it.
     await ctx.js.publish(dlqSubject(tenantId), bytes, { msgID: `dlq.${messageId}` });

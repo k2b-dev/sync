@@ -86,6 +86,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     owner,
     configKey: JSON.stringify(["ephemeral", config.id, owner, config.ttlMs, history, maxValueBytes, replicas]),
     natsNames: [`KV_${bucket}`],
+    maxMessageBytes: maxValueBytes,
     provision: async (ctx: ProvisionContext) => {
       kv = await ensureKv(ctx, identity, owner, bucket, {
         history,

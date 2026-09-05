@@ -76,6 +76,8 @@ export type Declaration = {
   configKey: string;
   /** NATS resource names this declaration owns (for diagnostics). */
   natsNames: string[];
+  /** Largest single NATS message this resource may publish; checked against the server's max_payload. */
+  maxMessageBytes?: number;
   provision(ctx: ProvisionContext): Promise<void>;
   summary?(ctx: ProvisionContext): Promise<Record<string, JsonValue>>;
 };
@@ -174,6 +176,18 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     }
   };
 
+  /**
+   * A payload limit above the server's max_payload would fail at the first
+   * large publish instead of at startup — refuse it while provisioning.
+   */
+  const assertFitsServerPayload = (entry: DeclarationEntry): void => {
+    const serverMax = nc.info?.max_payload;
+    if (entry.maxMessageBytes === undefined || serverMax === undefined || entry.maxMessageBytes <= serverMax) return;
+    throw new UnsupportedServerError(
+      `${entry.identity.kind} ${entry.identity.id} may publish messages of ${entry.maxMessageBytes} bytes, but the NATS server max_payload is ${serverMax} bytes — lower the limit or raise max_payload`,
+    );
+  };
+
   const buildContext = (): Promise<ProvisionContext> => {
     ctxPromise ??= (async () => {
       const jsm = await jetstreamManager(nc);
@@ -188,6 +202,7 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     if (entry.inflight) return entry.inflight;
     entry.inflight = (async () => {
       try {
+        assertFitsServerPayload(entry);
         await entry.provision(context);
         entry.state = "ready";
         entry.error = undefined;
