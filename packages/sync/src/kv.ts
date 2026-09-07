@@ -12,7 +12,7 @@ import type { ProvisionContext } from "./resources.ts";
 
 // 10071/10164 = wrong last sequence; the numeric codes are the stable
 // contract, the message text is only a fallback.
-const isCasConflict = (error: unknown): boolean =>
+export const isCasConflict = (error: unknown): boolean =>
   (error instanceof JetStreamApiError && (error.code === 10071 || error.code === 10164)) ||
   /wrong last sequence/i.test(asError(error).message);
 

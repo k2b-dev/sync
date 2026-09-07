@@ -93,12 +93,15 @@ await j.submit({ key, input, tenantId?, delayMs?, at?, orderingKey?, meta?, coal
 // coalesce: true = at most one queued-or-running job per key, released when the
 // job settles (success or dead letter) — duplicate submits return the original
 // jobId; the key is immediately reusable after completion (no time window).
+// The first accepted input wins. Retrying an uncertain publication repairs
+// that input; duplicate calls do not replace it. Long runs must heartbeat.
 
 await j.submitMany(iterableOrAsyncIterable, {
   publishConcurrency?,   // default 16 in-flight publish promises
   maxPendingBytes?,      // default 8 MiB in-flight encoded bytes (local backpressure)
   signal?,
 }); // → { accepted, duplicates }; throws BatchSubmitError (accepted stay accepted)
+// Coalescing has the same behavior as submit(), including within one batch.
 
 await j.process({
   concurrency?, signal?,
@@ -112,6 +115,10 @@ await j.process({
 
 j.deadLetters // DeadLetterStore<{ key, input }>
 ```
+
+Coalesced continuations preserve `orderingKey` and `meta` and reserve the successor before publication. A parent redelivery can finish that handoff without rerunning the completed handler. Delivery remains at-least-once. Requeueing a dead letter joins an active coalesced job for the same tenant and key, or creates a fresh generation if the key is free.
+
+When upgrading a 6.2.0 deployment to the corrected coalescing implementation, stop all old producers and workers first; mixed old/new writers are unsupported. Queued legacy messages can adopt their claims. An orphan legacy pending claim has no stored input and needs reconciliation against application state; submission throws `SyncUsageError` without deleting it. See the repository README's Job section.
 
 ## topic
 

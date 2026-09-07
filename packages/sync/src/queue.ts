@@ -173,7 +173,13 @@ export const createQueueCore = <T, D = T>(
     provisionExtra?: (ctx: ProvisionContext) => Promise<void>;
     extraNatsNames?: string[];
     /** Called before a dead-letter transfer settles (job claim release). */
-    onDeadLetter?: (envelope: Envelope | null) => Promise<void>;
+    onDeadLetter?: (envelope: Envelope | null, msg: JsMsg) => Promise<void>;
+    /** Admit primitive-owned deliveries before handlers or terminal policies run. */
+    admit?: (envelope: Envelope, msg: JsMsg) => Promise<boolean>;
+    /** Renew primitive-owned coordination along with the delivery lease. */
+    heartbeat?: (envelope: Envelope, msg: JsMsg) => Promise<void>;
+    /** Requeue through the primitive's submission protocol when it owns one. */
+    requeue?: (message: QueueSend<T>, ext: Record<string, JsonValue>) => Promise<PublishReceipt>;
   },
   kind: SyncResourceKind,
   deadLetterData: (envelope: Envelope) => D = (envelope) => envelope.data as D,
@@ -469,6 +475,7 @@ export const createQueueCore = <T, D = T>(
     meta: envelope.meta,
     signal,
     heartbeat: async () => {
+      await config.heartbeat?.(envelope, msg);
       msg.working();
     },
   });
@@ -480,11 +487,17 @@ export const createQueueCore = <T, D = T>(
     reason: string,
     error?: string,
   ): Promise<void> => {
+    if (envelope && config.admit && !(await config.admit(envelope, msg))) {
+      await settleSuccess(msg, label, runtime.events, kind);
+      return;
+    }
     const messageId = extString(envelope, "messageId") ?? `seq-${msg.seq}`;
     const tenantId = envelope?.tenantId ?? DEFAULT_TENANT;
     const dlqEnvelope: Envelope = {
       v: 6,
       data: envelope?.data ?? null,
+      ...(envelope?.orderingKey === undefined ? {} : { orderingKey: envelope.orderingKey }),
+      ...(envelope?.meta === undefined ? {} : { meta: envelope.meta }),
       tenantId,
       publishedAt: new Date().toISOString(),
       ext: {
@@ -504,7 +517,7 @@ export const createQueueCore = <T, D = T>(
     await ctx.js.publish(dlqSubject(tenantId), bytes, { msgID: `dlq.${messageId}` });
     // Terminal settlement: release resources tied to the submission (claims)
     // before the ack, so a crash retries the release with the redelivery.
-    await config.onDeadLetter?.(envelope).catch(() => {});
+    await config.onDeadLetter?.(envelope, msg);
     await confirmedAck(msg, label).catch(() => {});
     runtime.events.emit({
       type: "dead_letter",
@@ -525,7 +538,7 @@ export const createQueueCore = <T, D = T>(
     runtime.events.emit({ type: "worker_started", resource: config.id, kind });
 
     /** Sleep out a retry delay while holding the delivery alive. */
-    const holdWithHeartbeat = async (msg: JsMsg, delayMs: number, signal: AbortSignal): Promise<void> => {
+    const holdWithHeartbeat = async (envelope: Envelope, msg: JsMsg, delayMs: number, signal: AbortSignal): Promise<void> => {
       const step = Math.max(1_000, Math.floor(delivery.ackWaitMs / 2));
       const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<void>();
       const onAbort = (): void => resolveAborted();
@@ -536,6 +549,7 @@ export const createQueueCore = <T, D = T>(
           const slice = Math.min(step, remaining);
           await Promise.race([Bun.sleep(slice), abortedPromise]);
           remaining -= slice;
+          await config.heartbeat?.(envelope, msg);
           msg.working();
         }
       } finally {
@@ -549,6 +563,10 @@ export const createQueueCore = <T, D = T>(
         envelope = decodeEnvelope(msg.data);
       } catch (error) {
         await deadLetterTransfer(ctx, msg, null, "invalid envelope", asError(error).message);
+        return;
+      }
+      if (config.admit && !(await config.admit(envelope, msg))) {
+        await settleSuccess(msg, label, runtime.events, kind);
         return;
       }
       let attempt = msg.info.deliveryCount;
@@ -579,6 +597,13 @@ export const createQueueCore = <T, D = T>(
         }
         if (signal.aborted) {
           msg.nak();
+          return;
+        }
+        // A completed job may already have handed off to its successor.
+        // Repair that handoff before applying a failure policy to the parent.
+        if (config.admit && !(await config.admit(envelope, msg))) {
+          settled("success");
+          await settleSuccess(msg, label, runtime.events, kind);
           return;
         }
         runtime.events.emit({ type: "handler_error", resource: config.id, kind, error: handlerError.message });
@@ -612,9 +637,13 @@ export const createQueueCore = <T, D = T>(
           // handler failures. A crash mid-hold restarts counting from the
           // NATS deliveryCount, so maxAttempts bounds attempts per lease,
           // not globally across crashes.
-          await holdWithHeartbeat(msg, delayMs, signal);
+          await holdWithHeartbeat(envelope, msg, delayMs, signal);
           if (signal.aborted) {
             msg.nak();
+            return;
+          }
+          if (config.admit && !(await config.admit(envelope, msg))) {
+            await settleSuccess(msg, label, runtime.events, kind);
             return;
           }
           attempt += 1;
@@ -805,7 +834,7 @@ export const createQueueCore = <T, D = T>(
       const ctx = await runtime.context();
       // Preserve primitive-specific ext fields (e.g. a job key) on requeue.
       const { attempts: _a, reason: _r, failedAt: _f, error: _e, messageId: _m, ...restExt } = entry.envelope.ext ?? {};
-      const receipt = await send(
+      const receipt = await (config.requeue ?? send)(
         {
           data: entry.envelope.data as T,
           tenantId: entry.envelope.tenantId,

@@ -118,6 +118,12 @@ await runs.process(
 
 Jobs do not store results or expose `join()` — durable domain status belongs in your database. `submitMany` is not atomic: on failure a `BatchSubmitError` reports the accepted and duplicate counts and prior accepted items stay accepted.
 
+`coalesce: true` keeps the first accepted input for each tenant and key. Both `submit` and `submitMany` use the same claim: duplicates join that job and do not replace its input. If publication fails with an unknown outcome, retrying the submission repairs the original pending job. Handlers still need to be idempotent and call `heartbeat()` during long work.
+
+`context.resubmit({ input, delayMs })` requests a continuation after the handler succeeds. Coalesced continuations retain the key across the handoff and preserve the original ordering key and metadata. Dead-letter requeue also respects an active coalesced key.
+
+**Upgrading existing 6.2.0 deployments:** the coalescing repair in this checkout requires stopping all 6.2.0 producers and workers before starting the corrected code. Do not run old and corrected writers together: old workers can overwrite or delete a newer claim. Existing queued jobs can adopt their legacy claims. A legacy pending claim without a queued message contains no recoverable input; a submission reports `SyncUsageError` instead of inventing a receipt. Reconcile that specific job with application-owned state before clearing its old claim and submitting it again. No streams or claims are automatically reset.
+
 ## Topic
 
 A retained event log with four deliberately different reads:
