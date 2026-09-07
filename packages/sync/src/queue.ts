@@ -486,6 +486,7 @@ export const createQueueCore = <T, D = T>(
     envelope: Envelope | null,
     reason: string,
     error?: string,
+    attempt = msg.info.deliveryCount,
   ): Promise<void> => {
     if (envelope && config.admit && !(await config.admit(envelope, msg))) {
       await settleSuccess(msg, label, runtime.events, kind);
@@ -503,7 +504,7 @@ export const createQueueCore = <T, D = T>(
       ext: {
         ...envelope?.ext,
         messageId,
-        attempts: msg.info.deliveryCount,
+        attempts: attempt,
         reason,
         failedAt: new Date().toISOString(),
         ...(error !== undefined ? { error: error.slice(0, 2_048) } : {}),
@@ -620,12 +621,12 @@ export const createQueueCore = <T, D = T>(
         }
         if (decision.action === "dead_letter") {
           settled("dead_letter");
-          await deadLetterTransfer(ctx, msg, envelope, decision.reason, handlerError.message);
+          await deadLetterTransfer(ctx, msg, envelope, decision.reason, handlerError.message, attempt);
           return;
         }
         if (attempt >= delivery.maxAttempts) {
           settled("dead_letter");
-          await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", handlerError.message);
+          await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", handlerError.message, attempt);
           return;
         }
         settled("retry");

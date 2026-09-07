@@ -77,6 +77,37 @@ describe("job submission", () => {
 });
 
 describe("job processing", () => {
+  test("partitioned failure policy dead letters retain the logical attempt", async () => {
+    const jobs = sync.job<RunInput>({
+      id: "part-policy-attempts",
+      ordering: { mode: "partitioned", partitions: 2 },
+      delivery: { maxAttempts: 5, backoffMs: [10], ackWaitMs: 5_000 },
+    });
+    const attempts: number[] = [];
+    const worker = await jobs.process(
+      {
+        onError: ({ context }) => context.attempt < 2
+          ? { action: "retry", delayMs: 10 }
+          : { action: "dead_letter", reason: "policy stopped retrying" },
+      },
+      async (context) => {
+        attempts.push(context.attempt);
+        throw new Error(`failure ${context.attempt}`);
+      },
+    );
+    try {
+      await jobs.submit({ key: "same", input: { runId: "x" }, orderingKey: "same" });
+      await waitFor(async () => (await jobs.deadLetters.list()).length === 1);
+      const [dead] = await jobs.deadLetters.list();
+      expect(attempts).toEqual([1, 2]);
+      expect(dead!.attempts).toBe(2);
+      expect(dead!.reason).toBe("policy stopped retrying");
+      expect(dead!.error).toBe("failure 2");
+    } finally {
+      await worker.drain();
+    }
+  });
+
   test("onError controls retry delay and dead-lettering; DLQ entries carry the key", async () => {
     const jobs = sync.job<RunInput>({
       id: "policy",

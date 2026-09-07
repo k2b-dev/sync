@@ -163,6 +163,30 @@ describe("queue reader", () => {
 });
 
 describe("partitioned ordering", () => {
+  test("dead letters retain the logical attempt after in-place retries", async () => {
+    const queue = sync.queue<Task>({
+      id: "part-dlq-attempts",
+      ordering: { mode: "partitioned", partitions: 2 },
+      delivery: { maxAttempts: 3, backoffMs: [10], ackWaitMs: 5_000 },
+    });
+    const attempts: number[] = [];
+    const worker = await queue.process({}, async (message) => {
+      attempts.push(message.attempt);
+      throw new Error(`failure ${message.attempt}`);
+    });
+    try {
+      await queue.send({ data: { n: 1 }, orderingKey: "same" });
+      await waitFor(async () => (await queue.deadLetters.list()).length === 1);
+      const [dead] = await queue.deadLetters.list();
+      expect(attempts).toEqual([1, 2, 3]);
+      expect(dead!.attempts).toBe(3);
+      expect(dead!.reason).toBe("max attempts exhausted");
+      expect(dead!.error).toBe("failure 3");
+    } finally {
+      await worker.drain();
+    }
+  });
+
   test("same orderingKey is serial and in order; different keys run in parallel", async () => {
     const queue = sync.queue<Task>({
       id: "partitioned",
