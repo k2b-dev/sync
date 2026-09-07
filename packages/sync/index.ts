@@ -1,7 +1,7 @@
 // @k2b/sync v6 — NATS-native distributed sync primitives for TypeScript and Bun.
 
 export { createSync } from "./src/sync.ts";
-export type { Sync } from "./src/sync.ts";
+export type { Sync, SyncControl } from "./src/sync.ts";
 
 export type {
   DrainResult,

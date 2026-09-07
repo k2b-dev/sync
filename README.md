@@ -289,6 +289,19 @@ for await (const event of sync.events()) { ... } // bounded structured events; s
 
 Observers are contained: a throwing or slow observer can never alter transport settlement.
 
+`sync.controls()` returns typed controls for queue, job, and scheduler resources
+already declared in this process. Reading the inventory performs no I/O and
+does not provision resources or start workers. Queue and job controls expose
+their existing `deadLetters` store; scheduler controls expose `list()`,
+`runNow()`, and `awaitRun()`.
+
+Identify controls by `{ namespace, kind, id }`; a queue and job may share an ID.
+Repeated declarations produce one inventory entry. Scheduler inspection reports
+`handlerAvailable` across all local handles of that scheduler, without merging
+their handlers or workers. Controls remain discoverable after workers stop.
+The inventory is process-local, not broker-wide, and supplies no authorization:
+applications must protect any administrative route that exposes it.
+
 ## Resource model
 
 User-provided ids never become raw NATS names. Every resource is identified by `{ namespace, kind, id }`, hashed into stable stream/KV/bucket names (`S6_Q_…`, `KV_S6_E_…`) and lower-case subject tokens (`sync.v6.<ns>.queue.<hash>.t.<tenant>.work`). The full identity, owner, and API version are stamped into resource metadata.

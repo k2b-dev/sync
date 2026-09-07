@@ -21,6 +21,7 @@ type Sync = {
   drain(options?: { timeoutMs?: number }): Promise<{ completed: number; aborted: number; timedOut: boolean }>;
   health(): SyncHealth;               // synchronous local state
   resources(): Promise<SyncResourceSummary[]>;
+  controls(): readonly SyncControl[]; // process-local control inventory, no I/O
   events(options?: { signal?: AbortSignal }): AsyncIterable<SyncEvent>;
   queue<T>(config: QueueConfig): Queue<T>;
   topic<T>(config: TopicConfig): Topic<T>;
@@ -288,6 +289,28 @@ const value = await retry<T>({
 expBackoff(attempt, { baseMs?, maxMs?, jitter? });
 isRetryableTransportError(error);   // network-vocabulary heuristics (no Redis codes in v6)
 ```
+
+## Diagnostics and controls
+
+`health()` returns local runtime state; `resources()` reads sanitized resource
+summaries. `controls()` exposes administrative handles for already declared
+queue, job, and scheduler resources without provisioning or starting workers.
+
+```ts
+type SyncControl = Readonly<{ namespace: string; id: string; owner: string } & (
+  | { kind: "queue" | "job"; deadLetters: DeadLetterStore<unknown> }
+  | { kind: "scheduler"; scheduler: Pick<Scheduler, "list" | "runNow" | "awaitRun"> }
+)>;
+```
+
+Identity is `{ namespace, kind, id }`: a queue and job with the same ID remain
+different controls. Repeated declarations produce one control. Scheduler
+inspection combines `handlerAvailable` across actual local handles without
+merging their callbacks or workers. Controls remain discoverable after workers
+stop and operate on the existing durable state, including DLQ tenant IDs and
+scheduler run history. The inventory does not discover resources in other
+processes. `owner` is metadata, not authorization; applications must protect
+administrative endpoints and audit mutations themselves.
 
 ## Events
 
