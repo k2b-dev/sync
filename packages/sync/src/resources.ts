@@ -1,4 +1,4 @@
-import { StorageType } from "@nats-io/jetstream";
+import { JetStreamApiCodes, JetStreamApiError, StorageType } from "@nats-io/jetstream";
 import type {
   ConsumerConfig,
   JetStreamClient,
@@ -316,7 +316,35 @@ export const setConsumerPause = async (
   until: Date,
   clustered: boolean,
 ): Promise<{ paused: boolean; pause_until?: string }> => {
-  await jsm.consumers.pause(stream, consumer, until);
+  const commandDeadline = performance.now() + (jsm.getOptions().timeout ?? 0);
+  let rejected: JetStreamApiError | undefined;
+  let retryRejected = false;
+  await retry({
+    run: async () => {
+      retryRejected = false;
+      if (rejected && performance.now() >= commandDeadline) throw rejected;
+      try {
+        await jsm.consumers.pause(stream, consumer, until);
+      } catch (error) {
+        if (!clustered || !(error instanceof JetStreamApiError) || error.code !== JetStreamApiCodes.ConsumerNotFound) throw error;
+        // INFO can see an in-flight creation before PAUSE's committed lookup.
+        // Retry only this rejected command, and only if that consumer exists.
+        try {
+          await jsm.consumers.info(stream, consumer);
+        } catch (lookupError) {
+          throw lookupError instanceof JetStreamApiError && lookupError.code === JetStreamApiCodes.ConsumerNotFound ? error : lookupError;
+        }
+        rejected = error;
+        retryRejected = true;
+        throw error;
+      }
+    },
+    after: ({ ctx }) => {
+      if (!retryRejected) return;
+      const remaining = commandDeadline - performance.now();
+      if (remaining > 0) ctx.reschedule({ delayMs: Math.min(ctx.expBackoff(), remaining) });
+    },
+  });
   const deadline = performance.now() + (jsm.getOptions().timeout ?? 0);
   const unconfirmed = new SyncError(`consumer ${stream}/${consumer}: requested pause state was not confirmed`);
   return retry({

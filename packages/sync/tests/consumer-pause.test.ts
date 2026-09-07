@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { AckPolicy, DeliverPolicy, JetStreamApiError, ReplayPolicy, jetstreamManager } from "@nats-io/jetstream";
 import type { ConsumerInfo } from "@nats-io/jetstream";
 import type { NatsConnection } from "@nats-io/nats-core";
+import { TimeoutError } from "@nats-io/nats-core";
 import { setConsumerPause } from "../src/resources.ts";
 import { connectToCluster } from "./cluster.ts";
 
@@ -107,5 +108,61 @@ test("missing consumer failures remain unchanged", async () => {
   jsm.consumers.pause = async () => { throw missing; };
   jsm.consumers.info = async () => { reads += 1; throw missing; };
   await expect(setConsumerPause(jsm, "stream", "consumer", new Date(0), true)).rejects.toBe(missing);
+  expect(reads).toBe(1);
+});
+
+test("a rejected pause waits for an existing consumer's creation to commit", async () => {
+  const jsm = await jetstreamManager(nc);
+  const until = new Date(Date.now() + 60_000);
+  const missing = new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
+  let commands = 0;
+  let reads = 0;
+  jsm.consumers.pause = async () => {
+    if (++commands === 1) throw missing;
+    return { paused: true, pause_until: until.toISOString() };
+  };
+  jsm.consumers.info = async () => {
+    reads += 1;
+    return commands === 1 ? state(new Date(0), false) : state(until, true);
+  };
+  expect((await setConsumerPause(jsm, "stream", "consumer", until, true)).paused).toBe(true);
+  expect(commands).toBe(2);
+  expect(reads).toBe(2);
+});
+
+test("rejected pause commands remain bounded when creation never commits", async () => {
+  const jsm = await jetstreamManager(nc);
+  jsm.getOptions = () => ({ timeout: 100 });
+  const missing = new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
+  let commands = 0;
+  jsm.consumers.pause = async () => { commands += 1; throw missing; };
+  jsm.consumers.info = async () => state(new Date(0), false);
+  await expect(setConsumerPause(jsm, "stream", "consumer", new Date(Date.now() + 60_000), true)).rejects.toBe(missing);
+  const settledCommands = commands;
+  await Bun.sleep(150);
+  expect(commands).toBe(settledCommands);
+  expect(commands).toBeGreaterThan(0);
+});
+
+test("a pause with an unknown acknowledgement is never republished", async () => {
+  const jsm = await jetstreamManager(nc);
+  const failure = new TimeoutError();
+  let commands = 0;
+  let reads = 0;
+  jsm.consumers.pause = async () => { commands += 1; throw failure; };
+  jsm.consumers.info = async () => { reads += 1; return state(new Date(0), false); };
+  await expect(setConsumerPause(jsm, "stream", "consumer", new Date(0), true)).rejects.toBe(failure);
+  expect(commands).toBe(1);
   expect(reads).toBe(0);
+});
+
+test("a failed existence check never retries a rejected pause", async () => {
+  const jsm = await jetstreamManager(nc);
+  const missing = new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
+  const failure = new TimeoutError();
+  let commands = 0;
+  jsm.consumers.pause = async () => { commands += 1; throw missing; };
+  jsm.consumers.info = async () => { throw failure; };
+  await expect(setConsumerPause(jsm, "stream", "consumer", new Date(0), true)).rejects.toBe(failure);
+  expect(commands).toBe(1);
 });
