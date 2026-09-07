@@ -6,7 +6,7 @@ import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts"
 import { ConflictError, CursorMismatchError, NotFoundError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
-import { ensureConsumer, ensureStream, toStorageType } from "./resources.ts";
+import { ensureConsumer, ensureStream, setConsumerPause, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import {
@@ -675,7 +675,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
     const until = new Date(Date.now() + (input.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
     try {
-      const result = await ctx.jsm.consumers.pause(stream, durable, until);
+      const result = await setConsumerPause(ctx.jsm, stream, durable, until, Boolean(runtime.nc.info?.cluster));
       return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
     } catch (error) {
       if (/consumer not found/i.test(asError(error).message)) {
@@ -692,7 +692,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     const ctx = await runtime.context();
     const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
     try {
-      const result = await ctx.jsm.consumers.resume(stream, durable);
+      const result = await setConsumerPause(ctx.jsm, stream, durable, new Date(0), Boolean(runtime.nc.info?.cluster));
       return { paused: result.paused };
     } catch (error) {
       if (/consumer not found/i.test(asError(error).message)) {

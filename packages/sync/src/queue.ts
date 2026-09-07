@@ -8,7 +8,7 @@ import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts"
 import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { SyncResourceKind } from "./naming.ts";
-import { ensureConsumer, ensureStream, toStorageType } from "./resources.ts";
+import { ensureConsumer, ensureStream, setConsumerPause, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import {
@@ -441,7 +441,7 @@ export const createQueueCore = <T, D = T>(
     let result: { paused: boolean; pause_until?: string } = { paused: false };
     const partitions = ordering.mode === "partitioned" ? ordering.partitions : 1;
     for (let p = 0; p < partitions; p++) {
-      result = await ctx.jsm.consumers.pause(stream, durableFor(ordering.mode === "partitioned" ? p : null), until);
+      result = await setConsumerPause(ctx.jsm, stream, durableFor(ordering.mode === "partitioned" ? p : null), until, Boolean(runtime.nc.info?.cluster));
     }
     return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
   };
@@ -456,7 +456,7 @@ export const createQueueCore = <T, D = T>(
     let result: { paused: boolean; pause_until?: string } = { paused: false };
     const partitions = ordering.mode === "partitioned" ? ordering.partitions : 1;
     for (let p = 0; p < partitions; p++) {
-      result = await ctx.jsm.consumers.resume(stream, durableFor(ordering.mode === "partitioned" ? p : null));
+      result = await setConsumerPause(ctx.jsm, stream, durableFor(ordering.mode === "partitioned" ? p : null), new Date(0), Boolean(runtime.nc.info?.cluster));
     }
     return { paused: result.paused };
   };

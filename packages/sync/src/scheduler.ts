@@ -8,7 +8,7 @@ import type { JsonValue } from "./codec.ts";
 import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
 import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, consumerName, resourceIdentity, streamName, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
-import { ensureConsumer, ensureKv, ensureStream, toStorageType } from "./resources.ts";
+import { ensureConsumer, ensureKv, ensureStream, setConsumerPause, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import { backoffDelayMs, millis, nanos, resolveDelivery } from "./types.ts";
@@ -705,7 +705,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     await ensureScheduleConsumer(input.id);
     const ctx = await runtime.context();
     const until = new Date(Date.now() + (input.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
-    const result = await ctx.jsm.consumers.pause(stream, consumerName(identity, input.id), until);
+    const result = await setConsumerPause(ctx.jsm, stream, consumerName(identity, input.id), until, Boolean(runtime.nc.info?.cluster));
     return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
   };
 
@@ -715,7 +715,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     if (existing === null) throw new NotFoundError(`schedule ${input.id} does not exist`);
     await ensureScheduleConsumer(input.id);
     const ctx = await runtime.context();
-    const result = await ctx.jsm.consumers.resume(stream, consumerName(identity, input.id));
+    const result = await setConsumerPause(ctx.jsm, stream, consumerName(identity, input.id), new Date(0), Boolean(runtime.nc.info?.cluster));
     return { paused: result.paused };
   };
 

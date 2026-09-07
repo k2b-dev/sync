@@ -8,12 +8,14 @@ import type {
 } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import type { KV, KvOptions } from "@nats-io/kv";
+import { TimeoutError } from "@nats-io/nats-core";
 import { Objm } from "@nats-io/obj";
 import type { ObjectStore as NatsObjectStore, ObjectStoreOptions } from "@nats-io/obj";
-import { ResourceDriftError, ResourceIdentityCollisionError, asError } from "./errors.ts";
+import { ResourceDriftError, ResourceIdentityCollisionError, SyncError, asError } from "./errors.ts";
 import type { ResourceDifference } from "./errors.ts";
 import type { ResourceIdentity } from "./naming.ts";
 import { resourceMetadata } from "./naming.ts";
+import { retry } from "./retry.ts";
 
 // ==========================
 // Provision context
@@ -139,7 +141,14 @@ export const ensureStream = async (
   let info: StreamInfo | null = null;
   let created = false;
   try {
-    info = await ctx.jsm.streams.info(config.name);
+    try {
+      info = await ctx.jsm.streams.info(config.name);
+    } catch (error) {
+      if (!(error instanceof TimeoutError)) throw error;
+      // A concurrent creator can assign the stream before its leader answers
+      // INFO. Re-read once; a timeout never establishes that it is absent.
+      info = await ctx.jsm.streams.info(config.name);
+    }
   } catch (error) {
     if (!isNotFound(error)) throw asError(error);
   }
@@ -297,4 +306,36 @@ export const ensureObjectStore = async (
   }
   if (differences.length > 0) throw new ResourceDriftError(`OBJ_${bucket}`, differences);
   return os;
+};
+
+/** A clustered pause acknowledgement confirms the proposal, not its application. */
+export const setConsumerPause = async (
+  jsm: JetStreamManager,
+  stream: string,
+  consumer: string,
+  until: Date,
+  clustered: boolean,
+): Promise<{ paused: boolean; pause_until?: string }> => {
+  await jsm.consumers.pause(stream, consumer, until);
+  const deadline = performance.now() + (jsm.getOptions().timeout ?? 0);
+  const unconfirmed = new SyncError(`consumer ${stream}/${consumer}: requested pause state was not confirmed`);
+  return retry({
+    run: async ({ ctx }) => {
+      if (ctx.attempt > 1 && performance.now() >= deadline) throw unconfirmed;
+      const info = await jsm.consumers.info(stream, consumer);
+      // Before a new clustered consumer elects a leader, INFO may expose only
+      // its proposed assignment. Established leader INFO reads applied state.
+      if ((clustered && !info.cluster?.leader) ||
+        info.config.pause_until === undefined || Date.parse(info.config.pause_until) !== until.getTime()) {
+        throw unconfirmed;
+      }
+      // Use server state: false is omitted, and a short pause may have expired.
+      return { paused: info.paused === true, pause_until: info.config.pause_until };
+    },
+    after: ({ ctx }) => {
+      if (ctx.error !== unconfirmed) return;
+      const remaining = deadline - performance.now();
+      if (remaining > 0) ctx.reschedule({ delayMs: Math.min(ctx.expBackoff(), remaining) });
+    },
+  });
 };

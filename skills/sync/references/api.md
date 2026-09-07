@@ -322,6 +322,8 @@ administrative endpoints and audit mutations themselves.
 
 ## NATS feature map
 
+Queue, job, topic-consumer, and scheduler pause/resume calls confirm the applied consumer state before returning. Already delivered work can finish; concurrent control requests can prevent confirmation and cause a bounded failure.
+
 Used and exposed: atomic batch publish (`sendBatch`/`submitBatch`/`publishBatch` — all-or-nothing, NO dedupe ids), per-subject expected sequence (`topic.publish({ expectedAfter })` → optimistic per-tenant event sourcing, `ConflictError` on lost races; also every internal CAS), consumer pausing (`queue/job.pause/resume`, `topic.pauseConsumer`, `scheduler.pause` — global, delivery-side only), per-message TTL (`queue.send({ ttlMs })` expiring work incl. between retries; internal: KV TTLs, schedule definitions), message schedules (delays, scheduler clock), replicas + storage per resource, durable pull consumer groups (`process({ consumer })` / competing workers).
 
 Deliberate non-goals: stream mirrors/sources (infra topology — would fight the drift model; run them operationally, Sync resources stay the source of truth), distributed message tracing (header-based at the NATS layer; trace with NATS tooling, Sync never blocks pass-through), fast-ingest/async persist (`PersistMode` weakens the "publish = quorum accepted" contract), priority groups/pinning (niche; revisit on demand), CRDTs (not a NATS feature; `ephemeral` revisions + `expectedAfter` are the building blocks).

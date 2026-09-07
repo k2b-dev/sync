@@ -87,6 +87,8 @@ await emails.deadLetters.requeue({ messageId: dead[0].messageId, idempotencyKey:
 - `ordering: { mode: "partitioned", partitions: 64 }` hashes `orderingKey` to a stable partition with strictly serial per-partition delivery — including across handler failures: partitioned retries happen in place (the delivery is held with heartbeats through the backoff) so younger messages can never overtake a retrying one. The partition count becomes the global in-flight ceiling; this is for per-aggregate processing, not general fan-out.
 - Retention limits (`maxAgeMs`/`maxBytes`) are a hard loss boundary: NATS forbids reject-new on streams with message schedules, so at the limits the **oldest pending work is dropped**. Size them generously.
 
+Queue, job, topic-consumer, and scheduler pause/resume calls wait for the broker to apply the requested state. Already delivered work can finish. A concurrent control request can prevent confirmation and cause the call to fail.
+
 ## Job
 
 The normal shape for background tasks: a queue plus a **required idempotent key**, retry policy, and bounded fan-out.
