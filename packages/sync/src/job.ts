@@ -8,6 +8,7 @@ import { isCasConflict, kvCasPut } from "./kv.ts";
 import { assertName, kvBucketName, resourceIdentity, streamName, subjectToken } from "./naming.ts";
 import { ensureKv, toStorageType } from "./resources.ts";
 import { createQueueCore } from "./queue.ts";
+import { retry } from "./retry.ts";
 import type { BatchReceipt, DeadLetterStore, PauseInfo, QueueConfig, QueueCore } from "./queue.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import type { MessageMeta, PublishReceipt } from "./types.ts";
@@ -284,13 +285,31 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     };
   };
 
-  const publishClaim = async (tenantId: string, key: string, claim: CoalescedClaim<Input>, revision: number): Promise<PublishReceipt> => {
-    const receipt = await core.send(claimMessage(tenantId, claim), claimExt(key, claim.generation));
+  const publishClaim = async (tenantId: string, key: string, claim: CoalescedClaim<Input>, revision: number, signal?: AbortSignal): Promise<PublishReceipt> => {
+    const ctx = await runtime.context();
+    const retryDeadline = performance.now() + (ctx.js.getOptions().timeout ?? 0);
+    let inProgress: JetStreamApiError | undefined;
+    const receipt = await retry({
+      signal,
+      run: () => {
+        if (inProgress && performance.now() >= retryDeadline) throw inProgress;
+        return core.send(claimMessage(tenantId, claim), claimExt(key, claim.generation));
+      },
+      after: ({ ctx: attempt }) => {
+        // Another helper may still be committing this exact message ID.
+        // Retry only this conflict, within the normal JetStream request window.
+        // A started request keeps its transport timeout; all unknown outcomes
+        // leave the original pending claim available for later repair.
+        if (!(attempt.error instanceof JetStreamApiError) || attempt.error.code !== 10158) return;
+        inProgress = attempt.error;
+        const remaining = retryDeadline - performance.now();
+        if (remaining > 0) attempt.reschedule({ delayMs: Math.min(attempt.expBackoff(), remaining) });
+      },
+    });
     if (claim.publishKey !== undefined && receipt.duplicate) {
       // A repeated DLQ request can refer to an already completed generation.
       // Requeue is immediate: its physical sequence either still carries this
       // generation, or the newly reserved claim must be released.
-      const ctx = await runtime.context();
       let current: Envelope | null;
       try {
         const stored = await ctx.jsm.streams.getMessage(streamName(identity), { seq: receipt.streamSequence });
@@ -310,7 +329,7 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     return receipt;
   };
 
-  const submitCoalesced = async (job: JobSubmit<Input>, publishKey?: string, prepared?: Awaited<ReturnType<typeof prepareClaim>>): Promise<PublishReceipt & { jobId: string }> => {
+  const submitCoalesced = async (job: JobSubmit<Input>, publishKey?: string, prepared?: Awaited<ReturnType<typeof prepareClaim>>, signal?: AbortSignal): Promise<PublishReceipt & { jobId: string }> => {
     const { claim: pending } = prepared ?? await prepareClaim(job, undefined, publishKey);
     const tenantId = job.tenantId ?? "default";
     while (true) {
@@ -323,14 +342,14 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
         if (!("generation" in claim)) {
           throw new SyncUsageError(`job ${config.id}: legacy pending coalesced key ${job.key} has no recoverable input; stop 6.2.0 writers and resolve the old submission before retrying`);
         }
-        const receipt = await publishClaim(tenantId, job.key, claim, loaded.revision);
+        const receipt = await publishClaim(tenantId, job.key, claim, loaded.revision, signal);
         return { ...receipt, duplicate: true, jobId: receipt.messageId };
       }
       const revision = await putClaim(tenantId, job.key, pending, loaded.revision);
       if (revision === null) continue;
       // Leave pending input intact on an unknown publish result. A later
       // submit can finish this exact generation rather than lose the job.
-      const receipt = await publishClaim(tenantId, job.key, pending, revision);
+      const receipt = await publishClaim(tenantId, job.key, pending, revision, signal);
       return { ...receipt, duplicate: publishKey === undefined ? false : receipt.duplicate, jobId: receipt.messageId };
     }
   };
@@ -409,7 +428,7 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
         await waitForCapacity(prepared.byteLength);
         if (firstError !== null) break;
         pendingBytes += prepared.byteLength;
-        const task = ("claim" in prepared ? submitCoalesced(job, undefined, prepared) : prepared.publish())
+        const task = ("claim" in prepared ? submitCoalesced(job, undefined, prepared, options.signal) : prepared.publish())
           .then((receipt) => {
             if (receipt.duplicate) duplicates += 1;
             else accepted += 1;
@@ -486,14 +505,14 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
             if (claim === null || !("generation" in claim)) return;
             if (claim.generation !== generation) {
               if (claim.parent === generation && claim.seq === undefined) {
-                await publishClaim(envelope.tenantId, key, claim, revision);
+                await publishClaim(envelope.tenantId, key, claim, revision, message.signal);
               }
               return;
             }
             if (claim.deliverySeq !== msg.seq) return;
             const updated = await putClaim(envelope.tenantId, key, successor, revision);
             if (updated === null) continue;
-            await publishClaim(envelope.tenantId, key, successor, updated);
+            await publishClaim(envelope.tenantId, key, successor, updated, message.signal);
             return;
           }
         }

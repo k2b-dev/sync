@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { jetstream, jetstreamManager } from "@nats-io/jetstream";
+import { JetStreamApiError, jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync, SyncUsageError } from "../index.ts";
@@ -83,6 +83,84 @@ const legacyStorage = async ({ nc, sync }: Fixture, id: string) => {
 };
 
 describe("coalesced job failure windows", () => {
+  test("an in-progress broker message ID retries the same accepted generation", () => withSync(async ({ nc, sync }) => {
+    const jobs = sync.job<{ value: string }>({ id: "in-progress" });
+    const request = nc.request.bind(nc);
+    const publications: string[] = [];
+    nc.request = async (subject, payload, options) => {
+      if (isWork(subject)) {
+        publications.push(options?.headers?.get("Nats-Msg-Id") ?? "");
+        if (publications.length <= 3) {
+          throw new JetStreamApiError({ code: 409, err_code: 10158, description: "duplicate message id is in process" });
+        }
+      }
+      return request(subject, payload, options);
+    };
+    const receipt = await jobs.submit({ key: "same", input: { value: "original" }, coalesce: true });
+    expect(receipt.duplicate).toBe(false);
+    expect(publications).toEqual(Array(4).fill(receipt.messageId));
+    expect((await jobs.submit({ key: "same", input: { value: "replacement" }, coalesce: true })).jobId).toBe(receipt.jobId);
+    const seen: string[] = [];
+    const worker = await jobs.process({}, async (context) => { seen.push(context.input.value); });
+    await waitFor(() => seen.length === 1);
+    await worker.drain();
+    expect(seen).toEqual(["original"]);
+  }), 30_000);
+
+  test("persistent broker message-ID conflicts stop within the request retry budget and remain recoverable", () => withSync(async ({ nc, sync }) => {
+    const jobs = sync.job<{ value: string }>({ id: "in-progress-budget" });
+    const request = nc.request.bind(nc);
+    const conflict = new JetStreamApiError({ code: 409, err_code: 10158, description: "duplicate message id is in process" });
+    let attempts = 0;
+    let started = 0;
+    nc.request = async (subject, payload, options) => {
+      if (isWork(subject)) {
+        if (attempts === 0) started = performance.now();
+        attempts += 1;
+        throw conflict;
+      }
+      return request(subject, payload, options);
+    };
+    const budget = jetstream(nc).getOptions().timeout ?? 0;
+    await expect(jobs.submit({ key: "same", input: { value: "original" }, coalesce: true })).rejects.toBe(conflict);
+    expect(attempts).toBeGreaterThan(1);
+    expect(performance.now() - started).toBeLessThan(budget + 2_000);
+    nc.request = request;
+    const recovered = await jobs.submit({ key: "same", input: { value: "replacement" }, coalesce: true });
+    expect(recovered.duplicate).toBe(true);
+    const seen: string[] = [];
+    const worker = await jobs.process({}, async (context) => { seen.push(context.input.value); });
+    await waitFor(() => seen.length === 1);
+    await worker.drain();
+    expect(seen).toEqual(["original"]);
+  }), 30_000);
+
+  test("submitMany aborts broker-conflict backoff and leaves its original pending input repairable", () => withSync(async ({ nc, sync }) => {
+    const jobs = sync.job<{ value: string }>({ id: "in-progress-abort" });
+    const request = nc.request.bind(nc);
+    const controller = new AbortController();
+    let attempts = 0;
+    nc.request = async (subject, payload, options) => {
+      if (isWork(subject)) {
+        attempts += 1;
+        if (attempts === 1) setTimeout(() => controller.abort(), 0);
+        throw new JetStreamApiError({ code: 409, err_code: 10158, description: "duplicate message id is in process" });
+      }
+      return request(subject, payload, options);
+    };
+    const result = jobs.submitMany([{ key: "same", input: { value: "original" }, coalesce: true }], { signal: controller.signal });
+    await expect(result).rejects.toThrow("retry aborted");
+    expect(attempts).toBe(1);
+    nc.request = request;
+    const recovered = await jobs.submit({ key: "same", input: { value: "replacement" }, coalesce: true });
+    expect(recovered.duplicate).toBe(true);
+    const seen: string[] = [];
+    const worker = await jobs.process({}, async (context) => { seen.push(context.input.value); });
+    await waitFor(() => seen.length === 1);
+    await worker.drain();
+    expect(seen).toEqual(["original"]);
+  }), 30_000);
+
   test("a later publisher recovers the original input after interruption before publication", () => withSync(async ({ nc, sync, peer }) => {
     const jobs = sync.job<{ value: string }>({ id: "unpublished" });
     const request = nc.request.bind(nc);
