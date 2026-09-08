@@ -55,7 +55,7 @@ await connection.drain();                              // then the caller's conn
 
 ## Failure-path cheatsheet
 
-- Queue/job/topic handler throws → nak with `backoffMs[attempt-1]` → after `maxAttempts` → DLQ. Queue/job use `deadLetters.list/requeue/delete`; topic uses `list/get/delete` and opt-in consumer-only `replay` through the original idempotent handler. Job `onError` can force `{ action: "retry", delayMs }` or `{ action: "dead_letter", reason }`; a throwing onError retries (never accidentally acks).
+- Queue/job/topic handler throws → nak with `backoffMs[attempt-1]` → after `maxAttempts` → DLQ. Queue/job use `deadLetters.list/requeue/delete`; admin inspection uses bounded `page({ limit, cursor })` with `{ entries, nextCursor }` and direct `get({ messageId, streamSequence })`. Pages are oldest-first and sequence cursors survive deletions; topic uses `list/get/delete` and opt-in consumer-only `replay` through the original idempotent handler. Job `onError` can force `{ action: "retry", delayMs }` or `{ action: "dead_letter", reason }`; a throwing onError retries (never accidentally acks).
 - Process dies → redelivery after `ackWaitMs` on another pod. Long handlers call `heartbeat()`.
 - Topic cursor below retention → `RetentionGapError` (re-snapshot); cursor from another topic → `CursorMismatchError`.
 - Ephemeral watch behind history → one `resync_required` event, then the iterator ends.

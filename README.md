@@ -78,6 +78,16 @@ const worker = await emails.process({ concurrency: 8 }, async (message) => {
 
 const dead = await emails.deadLetters.list();
 await emails.deadLetters.requeue({ messageId: dead[0].messageId, idempotencyKey: "retry-1" });
+
+// Admin inspection: bounded oldest-first pages, including deleted-cursor recovery.
+const page = await emails.deadLetters.page({ limit: 20 });
+const next = page.nextCursor
+  ? await emails.deadLetters.page({ limit: 20, cursor: page.nextCursor })
+  : null;
+const first = page.entries[0];
+const detail = first
+  ? await emails.deadLetters.get({ messageId: first.messageId, streamSequence: first.streamSequence })
+  : null;
 ```
 
 - `idempotencyKey` deduplicates within `dedupeWindowMs` (default 2 min), scoped per tenant.

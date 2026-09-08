@@ -228,6 +228,30 @@ describe("partitioned ordering", () => {
 });
 
 describe("hardening regressions", () => {
+  test("DLQ pages survive deleted cursors and direct details verify message identity", async () => {
+    const queue = sync.queue<Task>({ id: "dlq-pages" });
+    const reader = await queue.reader();
+    for (let n = 1; n <= 4; n++) {
+      await queue.send({ data: { n } });
+      const delivery = await reader.receive({ waitMs: 2_000 });
+      expect(delivery).not.toBeNull();
+      await delivery!.deadLetter({ reason: "test" });
+    }
+    await reader.close();
+    const first = await queue.deadLetters.page({ limit: 2 });
+    expect(first.entries.map((entry) => entry.data.n)).toEqual([1, 2]);
+    expect(first.nextCursor).not.toBeNull();
+    const entry = first.entries[1]!;
+    expect((await queue.deadLetters.get({ messageId: entry.messageId, streamSequence: entry.streamSequence }))?.data.n).toBe(2);
+    expect(await queue.deadLetters.get({ messageId: "wrong", streamSequence: entry.streamSequence })).toBeNull();
+    await queue.deadLetters.delete({ messageId: entry.messageId });
+    expect(await queue.deadLetters.get({ messageId: entry.messageId, streamSequence: entry.streamSequence })).toBeNull();
+    const second = await queue.deadLetters.page({ limit: 2, cursor: first.nextCursor! });
+    expect(second.entries.map((item) => item.data.n)).toEqual([3, 4]);
+    expect(second.nextCursor).toBeNull();
+    await expect(queue.deadLetters.page({ cursor: "invalid" })).rejects.toThrow("cursor");
+  }, 15_000);
+
   test("deadLetters.list terminates after the newest DLQ entry was deleted", async () => {
     const queue = sync.queue<Task>({
       id: "dlq-scan",

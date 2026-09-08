@@ -93,6 +93,10 @@ export type DeadLetter<T> = {
 };
 
 export type DeadLetterStore<T> = {
+  /** Bounded, oldest-first stream page; cursor survives deletion of previous entries. */
+  page(options?: { limit?: number; cursor?: string }): Promise<{ entries: (DeadLetter<T> & { streamSequence: number })[]; nextCursor: string | null }>;
+  /** Direct sequence lookup, verified against the original message identity. */
+  get(input: { messageId: string; streamSequence: number }): Promise<(DeadLetter<T> & { streamSequence: number }) | null>;
   list(options?: { limit?: number; after?: string }): Promise<DeadLetter<T>[]>;
   requeue(input: { messageId: string; idempotencyKey: string }): Promise<PublishReceipt>;
   delete(input: { messageId: string }): Promise<boolean>;
@@ -807,6 +811,39 @@ export const createQueueCore = <T, D = T>(
   };
 
   const deadLetters: DeadLetterStore<D> = {
+    page: async (options = {}) => {
+      await declaration.ready();
+      const limit = options.limit ?? 100;
+      const after = options.cursor === undefined ? 0 : Number(options.cursor);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new SyncUsageError("DLQ limit must be between 1 and 1000");
+      if (!Number.isSafeInteger(after) || after < 0 || (options.cursor !== undefined && String(after) !== options.cursor)) throw new SyncUsageError("invalid DLQ cursor");
+      const ctx = await runtime.context();
+      const state = (await ctx.jsm.streams.info(dlqStream)).state;
+      if (state.messages === 0 || after >= state.last_seq) return { entries: [], nextCursor: null };
+      const consumer = await ctx.js.consumers.get(dlqStream, { deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: after + 1 });
+      try {
+        const entries: (DeadLetter<D> & { streamSequence: number })[] = [];
+        let lastSequence = after;
+        let more = false;
+        const batch = await consumer.fetch({ max_messages: limit, expires: 1_000 });
+        for await (const msg of batch) {
+          lastSequence = msg.seq;
+          more = msg.info.pending > 0;
+          try { entries.push({ ...toDeadLetter(decodeEnvelope(msg.data)), streamSequence: msg.seq }); } catch { /* foreign entries still advance the cursor */ }
+        }
+        return { entries, nextCursor: more ? String(lastSequence) : null };
+      } finally { await consumer.delete().catch(() => {}); }
+    },
+    get: async ({ messageId, streamSequence }) => {
+      if (!Number.isSafeInteger(streamSequence) || streamSequence < 1) throw new SyncUsageError("DLQ streamSequence must be positive");
+      await declaration.ready();
+      const ctx = await runtime.context();
+      const msg = await ctx.jsm.streams.getMessage(dlqStream, { seq: streamSequence });
+      if (msg === null) return null;
+      const envelope = decodeEnvelope(msg.data);
+      if (extString(envelope, "messageId") !== messageId) return null;
+      return { ...toDeadLetter(envelope), streamSequence: msg.seq };
+    },
     list: async (options = {}) => {
       await declaration.ready();
       const limit = options.limit ?? 100;
