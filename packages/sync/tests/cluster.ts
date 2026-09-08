@@ -16,7 +16,7 @@ export const connectToCluster = async (
   options: { name?: string; servers?: string[] } = {},
 ): Promise<NatsConnection> => {
   return connect({
-    servers: options.servers ?? CLUSTER_SERVERS,
+    servers: options.servers ?? process.env.SYNC_TEST_SERVERS?.split(",") ?? CLUSTER_SERVERS,
     name: options.name ?? "sync-v6-test",
     // The cluster advertises its internal Docker hostnames (nats-1:4222 ...)
     // which are unreachable from the host. Only the seed list is valid here.

@@ -162,11 +162,44 @@ t.cursorAt(sequence);       // TopicCursor for a persisted sequence (never fabri
 await t.process({
   consumer,                       // same name competes, different names = independent cursors
   tenantId?, concurrency?, signal?,
+  recoverDeadLetters?: true,       // opt into direct operator recovery through this same handler
   delivery?,                      // consumer config — drift-checked across pods
   start?: "earliest" | "latest" | { after: TopicCursor },
 }, async (event /* TopicEvent & { attempt, signal } */) => { ... });
 // failure: backoff retries → per-consumer DLQ stream
 ```
+
+Topic controls appear in `sync.controls()` when `process()` first starts and
+remain after the worker stops; append/watch-only topics create no admin control.
+Every topic exposes `deadLetters.list({ limit?, after? })`, `get({ messageId })`,
+and `delete({ messageId })`. `messageId` is the DLQ stream sequence; `eventId`
+is the original event identity. A page contains at most 1,000 entries (default
+100); `after` remains valid after that entry is deleted. Entries identify the
+consumer and tenant, contain the failed payload, and report `replayAvailable`.
+
+With `process({ recoverDeadLetters: true, consumer, ... }, handler)`, recovery
+is available through `deadLetters.replay({ messageId, consumer, tenantId,
+timeoutMs?, signal? })`. It invokes that existing handler directly, using the
+original event identity, sequence, timestamp, and metadata, with `attempt: 1`.
+It never publishes into the topic, changes its head, or reruns another
+consumer. The result is `{ messageId, eventId, consumer, completed: true }`,
+not a publish receipt. Success removes the DLQ entry; a repeated request for
+that removed entry reports not found.
+
+Handlers must make effects idempotent by original event identity. A crash
+between the effect and DLQ deletion can repeat the effect. Recovery takes an
+existing worker slot and a per-entry distributed mutex lease. Opting in
+provisions one additional Sync mutex KV resource per topic. Requests default
+to 30 seconds and accept at most 120 seconds. Failure or abort retains the
+entry. A timed-out handler that ignores abort keeps its lease renewed until
+it settles or the runtime stops; an operator request cannot forcibly stop application code.
+Broker failure or process death can lose the lease, so it does not replace
+idempotent effects. Recovery is unavailable once the local worker stops.
+
+Historical topic DLQ entries without the original sequence and timestamp
+remain inspectable and deletable, but cannot be replayed safely. No cursor
+is fabricated and no historical message is silently republished.
+
 
 ## pump
 
@@ -296,11 +329,13 @@ isRetryableTransportError(error);   // network-vocabulary heuristics (no Redis c
 
 `health()` returns local runtime state; `resources()` reads sanitized resource
 summaries. `controls()` exposes administrative handles for already declared
-queue, job, and scheduler resources without provisioning or starting workers.
+queue, job, and scheduler resources, plus topics whose `process()` has started,
+without additional provisioning or starting workers.
 
 ```ts
 type SyncControl = Readonly<{ namespace: string; id: string; owner: string } & (
   | { kind: "queue" | "job"; deadLetters: DeadLetterStore<unknown> }
+  | { kind: "topic"; deadLetters: TopicDeadLetterStore<unknown> }
   | { kind: "scheduler"; scheduler: Pick<Scheduler, "list" | "runNow" | "awaitRun"> }
 )>;
 ```

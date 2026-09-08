@@ -160,7 +160,9 @@ await events.process({ consumer: "search-indexer", concurrency: 4 }, async (even
 
 Cursors are opaque and resource-bound (`CursorMismatchError` elsewhere). If a cursor points below the retained window — in `replay()`, `follow()`, or a fresh `process({ start: { after } })` consumer — Sync throws `RetentionGapError` instead of silently skipping; its `resumeAfter` cursor resumes from the first retained event without losing it. `live()` events carry no cursor and are suitable for invalidate-then-read, not as durable acceptance evidence.
 
-Two costs to know: `tenantId` on replay/follow is a client-side filter, not a partition — a tenant-scoped read streams the whole topic (all tenants) from the server; for high-volume multi-tenant logs prefer one topic per tenant or a durable `process()` consumer. And the per-consumer DLQ stream is write-only through Sync's API — inspect it with NATS tooling.
+`tenantId` on replay/follow is a client-side filter, not a partition — a tenant-scoped read streams the whole topic (all tenants) from the server; for high-volume multi-tenant logs prefer one topic per tenant or a durable `process()` consumer.
+
+Topic DLQ entries can be inspected and deleted through `deadLetters`; opt-in recovery targets only the original consumer.
 
 ## Pump
 
@@ -294,7 +296,15 @@ for await (const event of sync.events()) { ... } // bounded structured events; s
 Observers are contained: a throwing or slow observer can never alter transport settlement.
 
 `sync.controls()` returns typed controls for queue, job, and scheduler resources
-already declared in this process. Reading the inventory performs no I/O and
+and topics whose `process()` has started. Topic controls retain inspect/delete
+access after the worker stops; direct recovery requires an active handler
+registered with `recoverDeadLetters: true`. It preserves the original event
+identity and only invokes that consumer, never republishing the topic. Historical
+DLQ entries without original cursor metadata remain inspect/delete-only. See the
+[topic recovery contract](skills/sync/references/api.md#topic) for timeout and
+at-least-once behavior.
+
+The inventory includes resources already declared in this process. Reading the inventory performs no I/O and
 does not provision resources or start workers. Queue and job controls expose
 their existing `deadLetters` store; scheduler controls expose `list()`,
 `runNow()`, and `awaitRun()`.

@@ -171,7 +171,8 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
   };
 
   const extend: Mutex["extend"] = async (lock, options = {}) => {
-    runtime.assertActive();
+    // Existing work may finish during graceful drain; stopped workers must not renew leases.
+    if (runtime.health().state === "stopped") return false;
     const ttlMs = options.ttlMs ?? defaultTtlMs;
     const current = await readKey(lock.resource);
     if (current.record === null || current.record.ownerToken !== lock.ownerToken) {
@@ -190,7 +191,7 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
   };
 
   const release: Mutex["release"] = async (lock) => {
-    runtime.assertActive();
+    // Releasing an existing lease is settlement, including during/after drain.
     const store = await getKv();
     const current = await readKey(lock.resource);
     if (current.record === null || current.record.ownerToken !== lock.ownerToken) return false;

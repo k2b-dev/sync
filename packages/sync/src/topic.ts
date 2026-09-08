@@ -1,6 +1,6 @@
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
 import type { Consumer, JsMsg } from "@nats-io/jetstream";
-import { decodeEnvelope, encodeEnvelope, extString } from "./codec.ts";
+import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
 import { ConflictError, CursorMismatchError, NotFoundError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
@@ -20,6 +20,7 @@ import {
   resolveDelivery,
 } from "./types.ts";
 import type { DeliveryConfig, MessageMeta, PublishReceipt, RetentionConfig } from "./types.ts";
+import { createMutex } from "./mutex.ts";
 import { createWorkerRuntime } from "./worker.ts";
 import type { ProcessOptions, Worker } from "./worker.ts";
 
@@ -93,12 +94,53 @@ export type TopicHub<T> = {
 
 export type TopicProcessOptions = ProcessOptions & {
   consumer: string;
+  /** Allow operator recovery through this same idempotent handler. */
+  recoverDeadLetters?: boolean;
   tenantId?: string;
   delivery?: DeliveryConfig;
   start?: "earliest" | "latest" | { after: TopicCursor };
 };
 
+export type TopicDeadLetter<T> = {
+  /** Stable DLQ stream sequence, distinct for each failed consumer. */
+  messageId: string;
+  eventId: string;
+  consumer: string;
+  tenantId: string;
+  data: T;
+  attempts: number;
+  failedAt: Date;
+  reason: string;
+  error?: string;
+  /** Absent for historical/undecodable entries: never fabricate a cursor. */
+  event?: TopicEvent<T>;
+  replayAvailable: boolean;
+};
+
+export type TopicDeadLetterStore<T> = {
+  list(options?: { limit?: number; after?: string }): Promise<TopicDeadLetter<T>[]>;
+  get(input: { messageId: string }): Promise<TopicDeadLetter<T> | null>;
+  delete(input: { messageId: string }): Promise<boolean>;
+  /** Direct consumer-only recovery; no publish or new event. Effects remain at-least-once. */
+  replay(input: {
+    messageId: string;
+    consumer: string;
+    tenantId: string;
+    /** Defaults to 30s; maximum 120s. Aborted/noncooperative handlers retain the entry. */
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<{ messageId: string; eventId: string; consumer: string; completed: true }>;
+};
+
+type Recovery = {
+  available(): boolean;
+  run(event: TopicEvent<unknown>, signal: AbortSignal): Promise<void>;
+};
+/** Shared by handles for the same topic inside one runtime. */
+export type TopicRecoveries = Map<string, Set<Recovery>>;
+
 export type Topic<T> = {
+  deadLetters: TopicDeadLetterStore<T>;
   ready(): Promise<void>;
   publish(input: TopicPublish<T>): Promise<PublishReceipt & { eventId: string; cursor: TopicCursor }>;
   /**
@@ -188,7 +230,7 @@ const parseCursor = (identity: ResourceIdentity, cursor: TopicCursor, label: str
 // Topic factory
 // ==========================
 
-export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic<T> => {
+export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recoveries: TopicRecoveries = new Map(), onProcess: () => void = () => {}): Topic<T> => {
   const identity = resourceIdentity(runtime.namespace, "topic", config.id);
   const owner = config.owner ?? runtime.application;
   const retention = assertRetention(config.retention);
@@ -493,6 +535,12 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       }),
   });
 
+  const recoveryKey = (consumer: string, tenantId: string) => JSON.stringify([consumer, tenantId]);
+  const recoveryMutex = () => createMutex(runtime, {
+    id: `topic-recovery:${identity.subjectHash}`, owner, replicas,
+    ttlMs: 30_000, retry: { maxAttempts: 1 },
+  });
+
   const process: Topic<T>["process"] = async (options, handler) => {
     runtime.assertActive();
     assertName(options.consumer, "consumer");
@@ -529,8 +577,53 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       ...(startSeq !== null ? { opt_start_seq: startSeq } : {}),
     });
 
-    const wr = createWorkerRuntime(options, { onFinished: () => runtime.unregisterWorker(wr) });
+    if (options.recoverDeadLetters) await recoveryMutex().ready();
+    let recovery: Recovery | undefined;
+    const key = recoveryKey(options.consumer, tenantId);
+    const wr = createWorkerRuntime(options, { onFinished: () => {
+      runtime.unregisterWorker(wr);
+      if (recovery) {
+        const entries = recoveries.get(key);
+        entries?.delete(recovery);
+        if (entries?.size === 0) recoveries.delete(key);
+      }
+    } });
+    if (options.recoverDeadLetters) {
+      recovery = {
+        available: () => !wr.stopping,
+        run: async (event, signal) => {
+          while (wr.reserve(1) !== 1) {
+            signal.throwIfAborted();
+            if (wr.stopping) throw new ConflictError("topic recovery worker is stopping");
+            await new Promise<void>((resolve, reject) => {
+              const onAbort = () => reject(signal.reason);
+              signal.addEventListener("abort", onAbort, { once: true });
+              void wr.waitForSlot().then(() => {
+                signal.removeEventListener("abort", onAbort);
+                resolve();
+              });
+              if (signal.aborted) onAbort();
+            });
+          }
+          if (signal.aborted) { wr.releaseReserved(1); signal.throwIfAborted(); }
+          return new Promise<void>((resolve, reject) => {
+            wr.track(async (workerSignal) => {
+              try {
+                const handlerSignal = AbortSignal.any([signal, workerSignal]);
+                await handler({ ...event, data: event.data as T, attempt: 1, signal: handlerSignal });
+                handlerSignal.throwIfAborted();
+                resolve();
+              } catch (error) { reject(error); }
+            }, { fromReservation: true });
+          });
+        },
+      };
+      const entries = recoveries.get(key) ?? new Set<Recovery>();
+      entries.add(recovery);
+      recoveries.set(key, entries);
+    }
     runtime.registerWorker(wr);
+    onProcess();
     runtime.events.emit({ type: "worker_started", resource: config.id, kind: "topic" });
 
     const deadLetter = async (msg: JsMsg, envelope: Envelope | null, reason: string, error?: string): Promise<void> => {
@@ -540,8 +633,14 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         data: envelope?.data ?? null,
         tenantId: envelope?.tenantId ?? tenantId,
         publishedAt: new Date().toISOString(),
+        ...(envelope?.meta !== undefined ? { meta: envelope.meta } : {}),
+        ...(envelope?.orderingKey !== undefined ? { orderingKey: envelope.orderingKey } : {}),
         ext: {
           eventId,
+          ...(envelope !== null ? {
+            originalSequence: msg.seq,
+            originalPublishedAt: envelope.publishedAt,
+          } : {}),
           consumer: options.consumer,
           attempts: msg.info.deliveryCount,
           reason,
@@ -552,7 +651,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       // and must never be the reason an event cannot be dead-lettered.
       const bytes = encodeEnvelope(`topic ${config.id} dlq`, dlqEnvelope, maxPayloadBytes + DLQ_HEADROOM_BYTES);
       await ctx.js.publish(dlqSubject(options.consumer), bytes, {
-        msgID: `dlq.${subjectToken(options.consumer, "consumer")}.${eventId}`,
+        msgID: `dlq.${subjectToken(options.consumer, "consumer")}.${subjectToken(tenantId, "tenantId")}.${eventId}`,
       });
       await confirmedAck(msg, label).catch(() => {});
       runtime.events.emit({
@@ -712,6 +811,123 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       }
       throw error;
     }
+  };
+
+  const deadLetterSequence = (messageId: string): number => {
+    const sequence = Number(messageId);
+    if (!Number.isSafeInteger(sequence) || sequence < 1 || String(sequence) !== messageId) {
+      throw new SyncUsageError("topic dead letter messageId must be a positive stream sequence");
+    }
+    return sequence;
+  };
+  const recoveryFor = (consumer: string, tenantId: string) =>
+    [...(recoveries.get(recoveryKey(consumer, tenantId)) ?? [])].find((entry) => entry.available());
+  const toDeadLetter = (sequence: number, envelope: Envelope): TopicDeadLetter<T> => {
+    const consumer = extString(envelope, "consumer") ?? "";
+    const eventId = extString(envelope, "eventId") ?? "";
+    const originalSequence = extNumber(envelope, "originalSequence");
+    const originalPublishedAt = extString(envelope, "originalPublishedAt");
+    const event = originalSequence !== undefined && Number.isSafeInteger(originalSequence) && originalSequence > 0 &&
+      originalPublishedAt !== undefined && Number.isFinite(Date.parse(originalPublishedAt)) && eventId !== ""
+      ? toEvent({ ...envelope, publishedAt: originalPublishedAt }, originalSequence) : undefined;
+    return {
+      messageId: String(sequence), eventId, consumer, tenantId: envelope.tenantId,
+      data: envelope.data as T, attempts: extNumber(envelope, "attempts") ?? 0,
+      failedAt: new Date(envelope.publishedAt), reason: extString(envelope, "reason") ?? "unknown",
+      ...(extString(envelope, "error") !== undefined ? { error: extString(envelope, "error") } : {}),
+      ...(event !== undefined ? { event } : {}),
+      replayAvailable: event !== undefined && recoveryFor(consumer, envelope.tenantId) !== undefined,
+    };
+  };
+  const deadLetters: TopicDeadLetterStore<T> = {
+    list: async (options = {}) => {
+      await declaration.ready();
+      const limit = options.limit ?? 100;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new SyncUsageError("topic DLQ limit must be between 1 and 1000");
+      const start = options.after === undefined ? 1 : deadLetterSequence(options.after) + 1;
+      const ctx = await runtime.context();
+      const state = (await ctx.jsm.streams.info(dlqStream)).state;
+      if (state.messages === 0 || start > state.last_seq) return [];
+      const consumer = await ctx.js.consumers.get(dlqStream, {
+        deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: start,
+      });
+      try {
+        const batch = await consumer.fetch({ max_messages: limit, expires: 1_000 });
+        const entries: TopicDeadLetter<T>[] = [];
+        for await (const msg of batch) {
+          entries.push(toDeadLetter(msg.seq, decodeEnvelope(msg.data)));
+        }
+        return entries;
+      } finally { await consumer.delete().catch(() => {}); }
+    },
+    get: async ({ messageId }) => {
+      const sequence = deadLetterSequence(messageId);
+      await declaration.ready();
+      const ctx = await runtime.context();
+      const msg = await ctx.jsm.streams.getMessage(dlqStream, { seq: sequence });
+      return msg === null ? null : toDeadLetter(msg.seq, decodeEnvelope(msg.data));
+    },
+    delete: async ({ messageId }) => {
+      const sequence = deadLetterSequence(messageId);
+      await declaration.ready();
+      const ctx = await runtime.context();
+      return ctx.jsm.streams.deleteMessage(dlqStream, sequence);
+    },
+    replay: async (input) => {
+      runtime.assertActive();
+      deadLetterSequence(input.messageId);
+      const timeoutMs = input.timeoutMs ?? 30_000;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new SyncUsageError("topic recovery timeoutMs must be between 1 and 120000");
+      const initial = await deadLetters.get(input);
+      if (initial === null) throw new NotFoundError("topic dead letter not found");
+      if (initial.consumer !== input.consumer || initial.tenantId !== input.tenantId) throw new ConflictError("topic dead letter consumer or tenant mismatch");
+      const recovery = recoveryFor(input.consumer, input.tenantId);
+      if (initial.event === undefined || recovery === undefined) throw new SyncUsageError("topic dead letter has no recoverable original event or active recovery handler");
+      const controller = new AbortController();
+      const signal = AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]);
+      signal.throwIfAborted();
+      const mutex = recoveryMutex();
+      const lock = await mutex.acquire({ resource: input.messageId, signal });
+      if (lock === null) throw new ConflictError("topic dead letter recovery is already active");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let renewal: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const renew = async (): Promise<void> => {
+        if (settled) return;
+        try {
+          if (!await mutex.extend(lock)) {
+            controller.abort(new ConflictError("topic recovery lease lost; entry retained"));
+            return;
+          }
+        } catch (error) { controller.abort(error); return; }
+        if (!settled) renewal = setTimeout(() => { void renew(); }, 10_000);
+      };
+      renewal = setTimeout(() => { void renew(); }, 10_000);
+      const run = (async () => {
+        try {
+          const entry = await deadLetters.get(input);
+          if (entry === null) throw new NotFoundError("topic dead letter not found");
+          signal.throwIfAborted();
+          await recovery.run(initial.event!, signal);
+          signal.throwIfAborted();
+          await deadLetters.delete(input);
+          return { messageId: input.messageId, eventId: initial.eventId, consumer: input.consumer, completed: true as const };
+        } finally {
+          settled = true;
+          clearTimeout(timer);
+          clearTimeout(renewal);
+          await mutex.release(lock).catch(() => {});
+        }
+      })();
+      const aborted = new Promise<never>((_, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        void run.finally(() => signal.removeEventListener("abort", onAbort)).catch(() => {});
+        timer = setTimeout(() => controller.abort(new Error("topic recovery timed out; entry retained until handler settles")), timeoutMs);
+        if (signal.aborted) onAbort();
+      });
+      return Promise.race([run, aborted]);
+    },
   };
 
   const hubs = new Map<string, TopicHub<T>>();
@@ -896,6 +1112,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   };
 
   return {
+    deadLetters,
     ready: () => declaration.ready(),
     publish,
     publishBatch,

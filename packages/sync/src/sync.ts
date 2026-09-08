@@ -16,11 +16,12 @@ import type { DeadLetterStore, Queue, QueueConfig } from "./queue.ts";
 import { createScheduler } from "./scheduler.ts";
 import type { ScheduleInfo, Scheduler, SchedulerConfig } from "./scheduler.ts";
 import { createTopic } from "./topic.ts";
-import type { Topic, TopicConfig } from "./topic.ts";
+import type { Topic, TopicConfig, TopicDeadLetterStore, TopicRecoveries } from "./topic.ts";
 
 /** Controls for resources declared in this process. Identity includes kind. */
 export type SyncControl = Readonly<{ namespace: string; id: string; owner: string } & (
   | { kind: "queue" | "job"; deadLetters: DeadLetterStore<unknown> }
+  | { kind: "topic"; deadLetters: TopicDeadLetterStore<unknown> }
   | { kind: "scheduler"; scheduler: Pick<Scheduler, "list" | "runNow" | "awaitRun"> }
 )>;
 
@@ -55,6 +56,7 @@ export type Sync = {
 export const createSync = (config: SyncConfig): Sync => {
   const runtime: SyncRuntime = createRuntime(config);
   const controls = new Map<string, SyncControl>();
+  const topicRecoveries = new Map<string, TopicRecoveries>();
   const schedulerHandles = new Map<string, Scheduler[]>();
   const identity = (id: string, owner?: string) => ({ namespace: runtime.namespace, id, owner: owner ?? runtime.application });
   return {
@@ -64,7 +66,14 @@ export const createSync = (config: SyncConfig): Sync => {
     resources: () => runtime.resources(),
     controls: () => [...controls.values()],
     events: (options) => runtime.events.subscribe(options),
-    topic: <T>(topicConfig: TopicConfig) => createTopic<T>(runtime, topicConfig),
+    topic: <T>(topicConfig: TopicConfig) => {
+      const recoveries: TopicRecoveries = topicRecoveries.get(topicConfig.id) ?? new Map();
+      const handle = createTopic<T>(runtime, topicConfig, recoveries, () => {
+        controls.set(`topic:${topicConfig.id}`, { ...identity(topicConfig.id, topicConfig.owner), kind: "topic", deadLetters: handle.deadLetters });
+      });
+      topicRecoveries.set(topicConfig.id, recoveries);
+      return handle;
+    },
     queue: <T>(queueConfig: QueueConfig) => {
       const handle = createQueue<T>(runtime, queueConfig);
       controls.set(`queue:${queueConfig.id}`, { ...identity(queueConfig.id, queueConfig.owner), kind: "queue", deadLetters: handle.deadLetters });

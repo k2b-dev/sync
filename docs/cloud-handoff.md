@@ -2,6 +2,24 @@
 
 Sync v6 (NATS-native hard cut) is implemented and verified against a real three-node NATS 2.14 JetStream cluster. This document is the contract and checklist for the **separate Cloud migration epic**. Nothing in Cloud was modified by the Sync work, and Sync v6 is **not production-ready for Cloud until the migration below is complete and the end-user acceptance suite passes**.
 
+## Current implementation status — 2026-09-08
+
+The checklist below records the original migration requirements; it is not a
+live list of missing Cloud features. Cloud has implemented the v6 migration,
+including the separate NATS administration surface, generic DLQ health signals,
+metrics, and consumer-specific topic recovery. The latter is an unreleased Sync
+source change, carried by the Cloud checkout as a reproducible Bun patch on
+6.3.2. Publish and adopt that Sync release before publishing the Cloud npm
+library; Docker builds apply the workspace patch.
+
+Local acceptance includes a three-node cluster, isolated recovery tests,
+authenticated HTTP checks, and verification that the existing stream inventory
+survives the system-account configuration update. These checks do not constitute
+production acceptance. Production credentials, coordinated backups and cutover,
+provider-specific smoke checks, external monitoring, and reviewed legacy cleanup
+remain operator acceptance items. The canonical current operator guide is Cloud's
+`docs-site/docs/en/operations/nats-operations.md`.
+
 ## What Sync v6 gives Cloud
 
 - `createSync({ connection, namespace, application })` on one caller-owned, already connected NATS connection per app process. Sync reads no ENV and loads no credentials.

@@ -39,6 +39,8 @@ export type {
   Topic,
   TopicBatchEvent,
   TopicConfig,
+  TopicDeadLetter,
+  TopicDeadLetterStore,
   TopicCursor,
   TopicEvent,
   TopicHub,
