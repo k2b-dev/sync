@@ -134,8 +134,6 @@ type PreparedSend = {
   ttl?: string;
 };
 
-// Part of exported signatures; required for declaration emit.
-// fallow-ignore-next-line unused-type
 export type QueueCore<T, D = T> = {
   declarationReady(): Promise<void>;
   send(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PublishReceipt>;

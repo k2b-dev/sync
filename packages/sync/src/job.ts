@@ -149,10 +149,12 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
         last_by_subj: `$KV.${claimsBucket}.${claimKey(tenantId, key)}`,
       });
       if (entry === null) return { claim: null, revision: 0 };
+      // Tombstones: explicit KV delete/purge operations AND server-written
+      // TTL expiry markers (Nats-Marker-Reason, no KV-Operation, empty body).
+      const tombstone = entry.header.get("KV-Operation") !== "" ||
+        entry.header.get("Nats-Marker-Reason") !== "" || entry.data.length === 0;
       return {
-        claim: entry.header.get("KV-Operation") === ""
-          ? decodeJson<CoalescedClaim<Input> | LegacyClaim>(entry.data)
-          : null,
+        claim: tombstone ? null : decodeJson<CoalescedClaim<Input> | LegacyClaim>(entry.data),
         revision: entry.seq,
       };
     } catch (error) {
@@ -362,12 +364,18 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       const loaded = await loadClaim(envelope.tenantId, key);
       let claim = loaded.claim;
       if (claim === null || !("generation" in claim)) {
-        // Existing 6.2.0 messages carry their original input and can adopt
-        // legacy empty/receipt claims. New generations never revive expired
-        // claims or run in place of a different accepted generation.
-        if (extString(envelope, "coalesceGeneration") !== undefined ||
-          (claim?.jobId !== undefined && claim.jobId !== generation)) return false;
-        claim = { generation, input: envelope.data as Input, jobId: generation,
+        // A legacy 6.2.0 receipt naming another job belongs to that job; a
+        // legacy pending claim is adopted like a missing one.
+        if (claim?.jobId !== undefined && claim.jobId !== generation) return false;
+        // No claim: either the claim record was lost (TTL/purge) while the
+        // accepted message survived, or a completed run was released right
+        // before its ack was confirmed. Accepted work is never dropped
+        // silently — adopt the claim and run (at-least-once).
+        if (claim === null && extString(envelope, "coalesceGeneration") !== undefined) {
+          runtime.events.emit({ type: "redelivery", resource: config.id, kind: "job",
+            detail: { key, orphanClaimAdopted: true } });
+        }
+        claim = { generation, input: envelope.data as Input, jobId: extString(envelope, "messageId") ?? generation,
           ...(envelope.orderingKey === undefined ? {} : { orderingKey: envelope.orderingKey }),
           ...(envelope.meta === undefined ? {} : { meta: envelope.meta }) };
       }

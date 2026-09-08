@@ -209,6 +209,13 @@ describe("hardening regressions", () => {
 describe("coalescing submissions", () => {
   test("at most one queued-or-running per key; released on completion, not by a window", async () => {
     const jobs = sync.job<RunInput>({ id: "coalesce" });
+    const settled: Array<{ detail?: Record<string, unknown> }> = [];
+    const watching = new AbortController();
+    void (async () => {
+      for await (const e of sync.events({ signal: watching.signal })) {
+        if (e.type === "handler_settled" && e.resource === "coalesce") settled.push({ detail: e.detail });
+      }
+    })();
     let running = 0;
     const runs: string[] = [];
     const worker = await jobs.process({ concurrency: 4 }, async (context) => {
@@ -225,11 +232,15 @@ describe("coalescing submissions", () => {
     expect(dup.duplicate).toBe(true);
     expect(dup.jobId).toBe(first.jobId);
     await waitFor(() => runs.length === 1, 15_000);
+    // The key is released after the handler returns (before the ack): wait
+    // for the settlement instead of racing the release.
+    await waitFor(() => settled.some((e) => e.detail?.status === "success"), 15_000);
     // Released on completion: an immediate resubmit runs again — a windowed
     // dedupe (2 min default) would have swallowed this.
     const again = await jobs.submit({ key: "task", input: { runId: "3" }, coalesce: true });
     expect(again.duplicate).toBe(false);
     await waitFor(() => runs.length === 2, 15_000);
+    watching.abort();
     await worker.drain();
   }, 45_000);
 
@@ -255,6 +266,13 @@ describe("coalescing submissions", () => {
 describe("continuations", () => {
   test("resubmit chains runs without dedupe collisions, also with coalesce", async () => {
     const jobs = sync.job<{ page: number }>({ id: "chain" });
+    let settledRuns = 0;
+    const watching = new AbortController();
+    void (async () => {
+      for await (const e of sync.events({ signal: watching.signal })) {
+        if (e.type === "handler_settled" && e.resource === "chain" && e.detail?.status === "success") settledRuns += 1;
+      }
+    })();
     const pages: number[] = [];
     const worker = await jobs.process({}, async (context) => {
       pages.push(context.input.page);
@@ -266,11 +284,15 @@ describe("continuations", () => {
     await jobs.submit({ key: "walk", input: { page: 1 }, coalesce: true });
     await waitFor(() => pages.length >= 3, 20_000);
     expect(pages).toEqual([1, 2, 3]);
+    // The claim is released after the last handler returns: wait for that
+    // settlement instead of racing it.
+    await waitFor(() => settledRuns >= 3, 15_000);
     // Chain finished => claim released => same key immediately reusable
     // (a windowed dedupe would swallow both the continuations AND this).
     const again = await jobs.submit({ key: "walk", input: { page: 3 }, coalesce: true });
     expect(again.duplicate).toBe(false);
     await waitFor(() => pages.length >= 4, 15_000);
+    watching.abort();
     await worker.drain();
   }, 45_000);
 });

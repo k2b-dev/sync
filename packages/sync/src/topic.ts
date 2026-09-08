@@ -87,7 +87,7 @@ export type TopicHub<T> = {
     bufferLimit?: number;
     signal?: AbortSignal;
   }): AsyncIterable<TopicEvent<T>>;
-  /** Stop the shared follower and end every subscriber. */
+  /** Stop the shared follower, end every subscriber, and forget the hub (later subscribe() throws). */
   close(): void;
 };
 
@@ -116,7 +116,8 @@ export type Topic<T> = {
    * subscribers, each with its own cursor. Built for per-connection tails
    * (WebSocket/SSE) where a follow() per connection would stream the whole
    * topic once per client. One hub per tenant per topic handle: repeated
-   * calls return the same hub until it is closed.
+   * calls return the same hub until close(). The shared follower runs only
+   * while subscribers exist and is torn down when the last one leaves.
    */
   hub(options?: { tenantId?: string }): TopicHub<T>;
   /** Stream sequence of a cursor issued by this topic (CursorMismatchError otherwise). */
@@ -127,6 +128,8 @@ export type Topic<T> = {
   pauseConsumer(input: { consumer: string; tenantId?: string; untilMs?: number }): Promise<{ paused: boolean; pauseUntil?: Date }>;
   resumeConsumer(input: { consumer: string; tenantId?: string }): Promise<{ paused: boolean }>;
   latestCursor(options?: { tenantId?: string }): Promise<TopicCursor | null>;
+  /** Cursor of the newest assigned sequence across ALL tenants (one stream lookup); cursorAt(0) when empty. */
+  head(): Promise<TopicCursor>;
   live(options?: { tenantId?: string; signal?: AbortSignal }): AsyncIterable<TopicLiveEvent<T>>;
   replay(options?: {
     tenantId?: string;
@@ -323,6 +326,12 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     return msg === null ? null : cursorOf(identity, msg.seq);
   };
 
+  const head: Topic<T>["head"] = async () => {
+    await declaration.ready();
+    const ctx = await runtime.context();
+    return cursorOf(identity, (await ctx.jsm.streams.info(stream)).state.last_seq);
+  };
+
   const live: Topic<T>["live"] = (options = {}) => {
     const tenantId = options.tenantId ?? DEFAULT_TENANT;
     return {
@@ -457,6 +466,9 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
       messages.stop();
+      // Ordered consumers are ephemeral with a 5-minute inactivity threshold;
+      // per-connection replays/tails must not leave thousands of them behind.
+      void consumer.delete().catch(() => {});
     }
   }
 
@@ -717,38 +729,38 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       notify: (() => void) | null;
       done: boolean;
     };
-    const subs = new Set<Sub>();
-    const follower = new AbortController();
-    let followerStarted = false;
-    let headSeq = 0;
-    let closed = false;
-    /** Set when the shared follower died; the hub is retired and re-created on the next hub() call. */
-    let failure: Error | null = null;
-
-    const retire = (): void => {
-      closed = true;
-      if (hubs.get(tenantId) === created) hubs.delete(tenantId);
+    /** One shared follow() run: started by the first subscriber, torn down by the last. */
+    type Follower = {
+      controller: AbortController;
+      /** Sequence the live tail is anchored at; catch-up replays end exactly here. */
+      headSeq: number;
+      headKnown: Promise<void>;
+      failure: Error | null;
     };
+    const subs = new Set<Sub>();
+    let follower: Follower | null = null;
+    let closed = false;
 
     const wake = (sub: Sub): void => {
       sub.notify?.();
       sub.notify = null;
     };
 
-    const ensureFollower = (): void => {
-      if (followerStarted || closed) return;
-      followerStarted = true;
+    const startFollower = (): Follower => {
+      const controller = new AbortController();
+      const headKnown = Promise.withResolvers<void>();
+      const run: Follower = { controller, headSeq: 0, headKnown: headKnown.promise, failure: null };
       (async () => {
         try {
           // The shared tail starts at the current head: history is served per
           // subscriber via replay, never through the live buffer.
           const head = await latestCursor({ tenantId });
-          if (head !== null) headSeq = parseCursor(identity, head, "cursor");
-          for await (const event of follow({ tenantId, ...(head !== null ? { after: head } : {}), signal: follower.signal })) {
-            headSeq = parseCursor(identity, event.cursor, "cursor");
+          if (head !== null) run.headSeq = parseCursor(identity, head, "cursor");
+          headKnown.resolve();
+          for await (const event of follow({ tenantId, ...(head !== null ? { after: head } : {}), signal: controller.signal })) {
+            run.headSeq = parseCursor(identity, event.cursor, "cursor");
             for (const sub of subs) {
               if (sub.done) continue;
-
               if (sub.buffer.length >= sub.limit) {
                 // Slow subscriber: end it explicitly instead of buffering
                 // without bound — it resubscribes from its last cursor.
@@ -761,17 +773,20 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
             }
           }
         } catch (error) {
-          failure = asError(error);
+          run.failure = asError(error);
+          headKnown.resolve();
           for (const sub of subs) {
-            sub.failed = failure;
+            sub.failed = run.failure;
             wake(sub);
           }
         } finally {
-          // A follower that ended (error or close) must not keep serving a
-          // memoized hub whose subscribers would wait forever.
-          retire();
+          // This run is over (failure, teardown, or close): the next subscriber
+          // starts a fresh follower instead of waiting on a dead one.
+          if (follower === run) follower = null;
+          for (const sub of subs) wake(sub);
         }
       })();
+      return run;
     };
 
     const subscribe: TopicHub<T>["subscribe"] = (options = {}) => ({
@@ -784,8 +799,9 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       signal?: AbortSignal;
     }): AsyncGenerator<TopicEvent<T>> {
       runtime.assertActive();
-      if (failure !== null) throw failure;
-      if (closed || options.signal?.aborted) return;
+      if (closed) throw new SyncUsageError(`topic ${config.id}: hub for tenant ${tenantId} is closed`);
+      if (options.signal?.aborted) return;
+      const afterSeq = options.after === undefined ? null : parseCursor(identity, options.after, "after");
       const sub: Sub = {
         buffer: [],
         limit: options.bufferLimit ?? 1_024,
@@ -798,25 +814,29 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       // Register BEFORE the catch-up replay so no event can fall between the
       // replay head and the live tail; duplicates are dropped by sequence.
       subs.add(sub);
-      ensureFollower();
-      // Live-only subscribers must not receive events from before they
-      // subscribed (buffered for other subscribers or raced in).
-      if (options.after === undefined) sub.lastSeq = headSeq;
+      const run = follower ?? (follower = startFollower());
       const onAbort = (): void => {
         sub.done = true;
         wake(sub);
       };
       options.signal?.addEventListener("abort", onAbort, { once: true });
       try {
-        if (options.after !== undefined) {
-          for await (const event of replay({ tenantId, after: options.after })) {
+        // Replaying exactly up to the follower's anchor closes the gap a
+        // concurrent publish could open between an independent replay head
+        // and the tail start.
+        await run.headKnown;
+        if (sub.failed !== null || run.failure !== null) throw sub.failed ?? run.failure;
+        if (closed || sub.done) return;
+        // Cursor subscribers own everything up to their cursor; live-only
+        // subscribers own everything up to the anchor (buffered for others).
+        sub.lastSeq = afterSeq ?? run.headSeq;
+        if (afterSeq !== null && afterSeq < run.headSeq) {
+          for await (const event of replay({ tenantId, after: options.after!, until: cursorOf(identity, run.headSeq) })) {
             sub.lastSeq = parseCursor(identity, event.cursor, "cursor");
             yield event;
           }
         }
         while (!sub.done) {
-          // A dead follower must surface as an error even though retiring the
-          // hub also marks it closed; a plain close() ends subscribers quietly.
           if (sub.failed !== null) throw sub.failed;
           if (closed) return;
           if (sub.overflowed) {
@@ -842,14 +862,22 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         sub.done = true;
         subs.delete(sub);
         options.signal?.removeEventListener("abort", onAbort);
+        // The last subscriber leaving ends the shared follower: an idle hub
+        // must not keep a whole-topic consumer alive for the process lifetime.
+        if (subs.size === 0 && follower === run) {
+          follower = null;
+          run.controller.abort();
+        }
       }
     }
 
     const created: TopicHub<T> = {
       subscribe,
       close: () => {
-        retire();
-        follower.abort();
+        closed = true;
+        if (hubs.get(tenantId) === created) hubs.delete(tenantId);
+        follower?.controller.abort();
+        follower = null;
         for (const sub of subs) {
           sub.done = true;
           wake(sub);
@@ -872,6 +900,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     publish,
     publishBatch,
     latestCursor,
+    head,
     live,
     replay,
     follow,

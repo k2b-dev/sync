@@ -3,7 +3,7 @@ import { jetstreamManager } from "@nats-io/jetstream";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync } from "../src/sync.ts";
 import type { Sync } from "../src/sync.ts";
-import { ConflictError, CursorMismatchError, ResourceDriftError, RetentionGapError } from "../src/errors.ts";
+import { ConflictError, CursorMismatchError, ResourceDriftError, RetentionGapError, SyncUsageError } from "../src/errors.ts";
 import { connectToCluster, uniqueName } from "./cluster.ts";
 import { cleanupNamespaces, collect, testNamespace, waitFor } from "./helpers.ts";
 
@@ -528,13 +528,85 @@ describe("sequences and cursor helpers", () => {
     }
     await run;
     expect(error).toBeInstanceOf(RetentionGapError);
-    await expect(collect(dead.subscribe(), 1)).rejects.toBeInstanceOf(RetentionGapError); // late subscriber, same dead hub
-    const fresh = topic.hub();
-    expect(fresh).not.toBe(dead);
-    const received = collect(fresh.subscribe(), 1);
-    await Bun.sleep(300);
+    // The hub identity survives; the next subscriber starts a fresh follower.
+    expect(topic.hub()).toBe(dead);
+    const anchor = await topic.head();
+    const received = collect(dead.subscribe({ after: anchor }), 1);
     await topic.publish({ data: { n: 2 } });
     expect((await received).map((e) => e.data.n)).toEqual([2]);
-    fresh.close();
+    dead.close();
+    await expect(collect(dead.subscribe(), 1)).rejects.toBeInstanceOf(SyncUsageError); // closed hubs refuse loudly
+  }, 30_000);
+});
+
+describe("hub lifecycle and head", () => {
+  test("the last subscriber leaving tears the follower down; the memoized hub still serves later subscribers", async () => {
+    const topic = sync.topic<Event>(topicConfig("hub-idle"));
+    const hub = topic.hub();
+    const controller = new AbortController();
+    const run = collect(hub.subscribe({ signal: controller.signal }));
+    await Bun.sleep(300); // follower running
+    controller.abort();
+    await run;
+    // No subscriber left: the shared consumer is gone until the next subscribe.
+    const jsm = await jetstreamManager(nc);
+    await waitFor(async () => {
+      for await (const info of jsm.streams.list()) {
+        if (info.config.metadata?.["sync.id"] === "hub-idle" && !info.config.name.includes("D_")) {
+          return (await jsm.streams.info(info.config.name)).state.consumer_count === 0;
+        }
+      }
+      return false;
+    }, 10_000);
+    expect(topic.hub()).toBe(hub);
+    const anchor = await topic.head();
+    const received = collect(hub.subscribe({ after: anchor }), 1);
+    await topic.publish({ data: { n: 7 } });
+    expect((await received).map((e) => e.data.n)).toEqual([7]);
+    hub.close();
+  }, 20_000);
+
+  test("head() is the newest event of any tenant; cursorAt(0) when empty", async () => {
+    const topic = sync.topic<Event>(topicConfig("head"));
+    expect(await topic.head()).toBe(topic.cursorAt(0));
+    await topic.publish({ data: { n: 1 }, tenantId: "a" });
+    const last = await topic.publish({ data: { n: 2 }, tenantId: "b" });
+    expect(await topic.head()).toBe(last.cursor);
+    expect(await topic.latestCursor({ tenantId: "a" })).not.toBe(last.cursor);
+  });
+
+  test("subscribers joining under concurrent publishing see contiguous sequences across the splice", async () => {
+    const topic = sync.topic<Event>(topicConfig("hub-splice"));
+    const anchor = await topic.publish({ data: { n: 0 } });
+    const total = 60;
+    const publishing = (async () => {
+      for (let n = 1; n <= total; n++) {
+        await topic.publish({ data: { n } });
+        await Bun.sleep(5);
+      }
+    })();
+    // Hop through the stream: each hop takes a few events and leaves, which
+    // tears the follower down; the next hop starts a FRESH follower mid-stream
+    // from the last seen cursor. Every splice must be gap- and duplicate-free.
+    const seen: number[] = [];
+    let cursor = anchor.cursor;
+    let finished = false;
+    while (!finished) {
+      let taken = 0;
+      for await (const e of topic.hub().subscribe({ after: cursor })) {
+        seen.push(e.sequence);
+        cursor = e.cursor;
+        taken += 1;
+        if (e.data.n === total) {
+          finished = true;
+          break;
+        }
+        if (taken >= 8) break;
+      }
+      await Bun.sleep(30);
+    }
+    await publishing;
+    const expected = Array.from({ length: total }, (_, i) => anchor.streamSequence + 1 + i);
+    expect(seen).toEqual(expected);
   }, 30_000);
 });

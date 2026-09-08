@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { JetStreamApiError, jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
+import { headers } from "@nats-io/nats-core";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync, SyncUsageError } from "../index.ts";
 import type { Sync } from "../index.ts";
@@ -584,5 +585,76 @@ describe("6.2.0 coalesced job upgrade", () => {
     expect(duplicate.jobId).toBe(current.jobId);
     expect(duplicate.streamSequence).toBe(current.seq);
     expect(await jobs.deadLetters.list()).toHaveLength(0);
+  }), 30_000);
+});
+
+describe("claim durability", () => {
+  test("an accepted coalesced message whose claim was lost is adopted and executed, not dropped", () => withSync(async (fixture) => {
+    const events: Record<string, unknown>[] = [];
+    const watching = new AbortController();
+    void (async () => {
+      for await (const e of fixture.sync.events({ signal: watching.signal })) {
+        if (e.type === "redelivery" && e.detail?.orphanClaimAdopted === true) events.push(e.detail);
+      }
+    })();
+    const jobs = fixture.sync.job<{ value: string }>({ id: "orphan" });
+    await jobs.ready();
+    const legacy = await legacyStorage(fixture, "orphan");
+    const accepted = await jobs.submit({ key: "same", input: { value: "accepted" }, coalesce: true });
+    expect(accepted.duplicate).toBe(false);
+    await legacy.claims.purge(legacy.key); // claim record gone, work message still queued
+    const seen: string[] = [];
+    const worker = await jobs.process({}, async (context) => { seen.push(context.input.value); });
+    try {
+      await waitFor(() => seen.length === 1, 15_000);
+      expect(events).toHaveLength(1);
+      await waitFor(async () => (await legacy.readClaim()) === null || (await legacy.readClaim())!.header.get("KV-Operation") !== "", 10_000);
+      expect((await jobs.submit({ key: "same", input: { value: "next" }, coalesce: true })).duplicate).toBe(false);
+    } finally {
+      watching.abort();
+      await worker.drain();
+    }
+  }), 30_000);
+
+  test("a TTL expiry marker on the claim key is a free key, not a parse error", () => withSync(async (fixture) => {
+    const jobs = fixture.sync.job<{ value: string }>({ id: "marker" });
+    await jobs.ready();
+    const legacy = await legacyStorage(fixture, "marker");
+    const bucket = (await fixture.sync.resources()).find((r) => r.kind === "job" && r.id === "marker")!
+      .natsNames.find((name) => name.startsWith("KV_"))!.slice(3);
+    const h = headers();
+    h.set("Nats-TTL", "1s");
+    await jetstream(fixture.nc).publish(`$KV.${bucket}.${legacy.key}`, JSON.stringify({ generation: "g0", input: {}, jobId: "g0" }), { headers: h });
+    await waitFor(async () => {
+      const entry = await legacy.readClaim();
+      return entry !== null && entry.data.length === 0; // server-written expiry marker
+    }, 10_000);
+    const receipt = await jobs.submit({ key: "same", input: { value: "fresh" }, coalesce: true });
+    expect(receipt.duplicate).toBe(false);
+  }), 30_000);
+
+  test("a failing settlement surfaces as handler_error and hands the delivery back", () => withSync(async (fixture) => {
+    const errors: string[] = [];
+    const watching = new AbortController();
+    void (async () => {
+      for await (const e of fixture.sync.events({ signal: watching.signal })) {
+        if (e.type === "handler_error" && e.resource === "broken-claims") errors.push(e.error ?? "");
+      }
+    })();
+    const jobs = fixture.sync.job<{ value: string }>({ id: "broken-claims" });
+    await jobs.ready();
+    await jobs.submit({ key: "same", input: { value: "accepted" }, coalesce: true });
+    const bucket = (await fixture.sync.resources()).find((r) => r.kind === "job" && r.id === "broken-claims")!
+      .natsNames.find((name) => name.startsWith("KV_"))!;
+    await (await jetstreamManager(fixture.nc)).streams.delete(bucket); // claim store unavailable
+    let ran = 0;
+    const worker = await jobs.process({}, async () => { ran += 1; });
+    try {
+      await waitFor(() => errors.some((e) => e.startsWith("delivery ")), 15_000);
+      expect(ran).toBe(0);
+    } finally {
+      watching.abort();
+      await worker.drain();
+    }
   }), 30_000);
 });

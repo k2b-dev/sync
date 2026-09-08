@@ -119,7 +119,7 @@ j.deadLetters // DeadLetterStore<{ key, input }>
 
 Coalesced continuations preserve `orderingKey` and `meta` and reserve the successor before publication. A parent redelivery can finish that handoff without rerunning the completed handler. Delivery remains at-least-once. Requeueing a dead letter joins an active coalesced job for the same tenant and key, or creates a fresh generation if the key is free.
 
-When upgrading a 6.2.0 deployment to the corrected coalescing implementation, stop all old producers and workers first; mixed old/new writers are unsupported. Queued legacy messages can adopt their claims. An orphan legacy pending claim has no stored input and needs reconciliation against application state; submission throws `SyncUsageError` without deleting it. See the repository README's Job section.
+When upgrading a 6.2.0 deployment to the corrected coalescing implementation, stop all old producers and workers first; mixed old/new writers are unsupported. Queued legacy messages can adopt their claims. An accepted coalesced message whose claim record is missing (lost/expired) adopts a fresh claim and runs — at-least-once, surfaced as a `redelivery` event with `detail.orphanClaimAdopted` — instead of being acknowledged silently. An orphan legacy pending claim has no stored input and needs reconciliation against application state; submission throws `SyncUsageError` without deleting it. See the repository README's Job section.
 
 ## topic
 
@@ -130,6 +130,7 @@ const r = await t.publish({ data, tenantId?, idempotencyKey?, orderingKey?, meta
 // → PublishReceipt & { eventId, cursor }
 
 await t.latestCursor({ tenantId? });        // TopicCursor | null, per tenant
+await t.head();                             // newest event of ANY tenant (one lookup); cursorAt(0) when empty
 
 for await (const e of t.live({ tenantId?, signal? })) {}    // broadcast, no cursor/replay
 for await (const e of t.replay({ tenantId?, after?, until?, signal? })) {} // to head-at-start
@@ -144,7 +145,8 @@ for await (const e of t.follow({ tenantId?, after?, signal? })) {}         // st
 // the server — prefer one topic per tenant or process() for high volume.
 
 const h = t.hub({ tenantId? });  // ONE shared follow() for many local subscribers;
-                                 // memoized per tenant per topic handle until close()
+                                 // memoized per tenant per topic handle; retired automatically
+                                 // when the last subscriber leaves (or on close())
 for await (const e of h.subscribe({ after?, bufferLimit? /* default 1024 */, signal? })) {}
 // catch-up replay splices into the live tail (seq-deduped); slow subscribers end
 // with RetentionGapError (resumeAfter = last delivered cursor) — resubscribe.

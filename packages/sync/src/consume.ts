@@ -56,7 +56,22 @@ export const runPullLoop = async (
       for await (const msg of batch) {
         if (wr.stopping) break; // unhandled deliveries redeliver after ackWait
         started += 1;
-        wr.track((signal) => onMessage(msg, signal), { fromReservation: true });
+        wr.track(
+          (signal) =>
+            onMessage(msg, signal).catch((error) => {
+              // Settlement code itself failed (e.g. claim store unavailable):
+              // surface it and hand the delivery back with a short backoff
+              // instead of holding it silently until ackWait or redelivering
+              // in a hot loop. nak() is a no-op after an ack.
+              options.events.emit({
+                type: "handler_error",
+                resource: options.resource,
+                error: `delivery ${msg.seq}: ${asError(error).message}`,
+              });
+              msg.nak(1_000);
+            }),
+          { fromReservation: true },
+        );
       }
     } catch (error) {
       if (wr.stopping) return;

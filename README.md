@@ -124,7 +124,9 @@ Jobs do not store results or expose `join()` — durable domain status belongs i
 
 `context.resubmit({ input, delayMs })` requests a continuation after the handler succeeds. Coalesced continuations retain the key across the handoff and preserve the original ordering key and metadata. Dead-letter requeue also respects an active coalesced key.
 
-**Upgrading existing 6.2.0 deployments:** the coalescing repair in this checkout requires stopping all 6.2.0 producers and workers before starting the corrected code. Do not run old and corrected writers together: old workers can overwrite or delete a newer claim. Existing queued jobs can adopt their legacy claims. A legacy pending claim without a queued message contains no recoverable input; a submission reports `SyncUsageError` instead of inventing a receipt. Reconcile that specific job with application-owned state before clearing its old claim and submitting it again. No streams or claims are automatically reset.
+An accepted coalesced message whose claim record is missing (lost or expired) adopts a fresh claim and runs instead of being acknowledged silently; the run is reported as a `redelivery` event with `detail.orphanClaimAdopted`.
+
+**Upgrading existing 6.2.0 deployments:** the coalescing repair (6.2.1+) requires stopping all 6.2.0 producers and workers before starting the corrected code. Do not run old and corrected writers together: old workers can overwrite or delete a newer claim. Existing queued jobs can adopt their legacy claims. A legacy pending claim without a queued message contains no recoverable input; a submission reports `SyncUsageError` instead of inventing a receipt. Reconcile that specific job with application-owned state before clearing its old claim and submitting it again. No streams or claims are automatically reset.
 
 ## Topic
 

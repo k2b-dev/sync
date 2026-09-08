@@ -1,6 +1,6 @@
 {
   "name": "@k2b/sync",
-  "version": "6.3.1",
+  "version": "6.3.2",
   "description": "NATS-native distributed sync primitives for TypeScript and Bun \u2014 queue, topic, job, pump, scheduler, mutex, ephemeral, object store, retry",
   "module": "index.ts",
   "type": "module",
