@@ -124,7 +124,7 @@ When upgrading a 6.2.0 deployment to the corrected coalescing implementation, st
 ## topic
 
 ```ts
-const t = sync.topic<T>({ id, owner?, retention /* required */, dedupeWindowMs?, maxPayloadBytes?, replicas? });
+const t = sync.topic<T>({ id, owner?, retention /* required */, deadLetterRetention? /* { maxAgeMs?, maxBytes? }, defaults to retention */, dedupeWindowMs?, maxPayloadBytes?, replicas? });
 
 const r = await t.publish({ data, tenantId?, idempotencyKey?, orderingKey?, meta? });
 // → PublishReceipt & { eventId, cursor }
@@ -141,8 +141,16 @@ for await (const e of t.follow({ tenantId?, after?, signal? })) {}         // st
 // after below retention → RetentionGapError (also for a fresh process({start:{after}}) consumer);
 // error.resumeAfter is the cursor that resumes from the first retained event.
 // foreign cursor → CursorMismatchError; mid-follow retention loss → RetentionGapError.
-// tenantId is a client-side filter: replay/follow stream the WHOLE topic from
-// the server — prefer one topic per tenant or process() for high volume.
+// tenantId is a server-side filter: replay/follow receive only that tenant.
+// Prefer ONE topic with tenantId per entity over a topic per entity: JetStream
+// reserves maxBytes x replicas per stream (log + DLQ) against the account.
+// Gap = the window no longer holds the position after your cursor (any tenant);
+// persist head() read BEFORE latestCursor({tenantId}) once the tenant is applied
+// up to that latest cursor, and refresh idle tenants before the window passes them.
+await sync.listTopics({ idPrefix? });  // AsyncIterable<{ id, owner, messages, bytes, maxBytes,
+                                       //   replicas, firstSequence, lastSequence, lastPublishedAt, createdAt }>
+                                       // broker-wide in this namespace; never provisions
+await t.destroy();                     // { destroyed } — deletes log + DLQ streams, retires the declaration
 
 const h = t.hub({ tenantId? });  // ONE shared follow() for many local subscribers;
                                  // memoized per tenant per topic handle; retired automatically

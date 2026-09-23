@@ -36,7 +36,7 @@ await connection.drain();                              // then the caller's conn
 - Idempotency keys dedupe only within `dedupeWindowMs` (default 2 min), scoped per tenant. Permanent uniqueness belongs in the application database.
 - Ordering exists only in partitioned queues (`ordering: { mode: "partitioned", partitions: N }`, requires `orderingKey`, serial per partition, partition count caps global in-flight).
 - Payloads are JSON, limited locally (128 KiB default envelope; 4 KiB ephemeral). Large artifacts go through `sync.objectStore()` explicitly — Sync never auto-offloads; pass the returned `ObjectRef` in job/queue payloads.
-- `tenantId` defaults to `"default"` and is a logical namespace, not a security boundary.
+- `tenantId` defaults to `"default"` and is a logical namespace, not a security boundary. Topic reads filter it on the server, so per-entity logs use ONE topic with `tenantId = entityId`, never a topic per entity: every topic reserves `(retention.maxBytes + deadLetterRetention.maxBytes) x replicas` against the JetStream account. Retire legacy per-entity topics with `sync.listTopics({ idPrefix })` + `topic.destroy()` after their events are captured.
 
 ## Choosing a primitive
 
@@ -57,7 +57,7 @@ await connection.drain();                              // then the caller's conn
 
 - Queue/job/topic handler throws → nak with `backoffMs[attempt-1]` → after `maxAttempts` → DLQ. Queue/job use `deadLetters.list/requeue/delete`; admin inspection uses bounded `page({ limit, cursor })` with `{ entries, nextCursor }` and direct `get({ messageId, streamSequence })`. Pages are oldest-first and sequence cursors survive deletions; topic uses `list/get/delete` and opt-in consumer-only `replay` through the original idempotent handler. Job `onError` can force `{ action: "retry", delayMs }` or `{ action: "dead_letter", reason }`; a throwing onError retries (never accidentally acks).
 - Process dies → redelivery after `ackWaitMs` on another pod. Long handlers call `heartbeat()`.
-- Topic cursor below retention → `RetentionGapError` (re-snapshot); cursor from another topic → `CursorMismatchError`.
+- Topic cursor below retention → `RetentionGapError` (re-snapshot); cursor from another topic → `CursorMismatchError`. On a shared topic the window is shared: persist `head()` (read before `latestCursor({ tenantId })`) as the tenant's cursor once its events are applied, so idle tenants do not fall below the window.
 - Ephemeral watch behind history → one `resync_required` event, then the iterator ends.
 - `sync.drain()` timeout → handler signals abort, unfinished deliveries are naked for other pods.
 - Errors to catch by name: `ResourceDriftError`, `PayloadTooLargeError`, `ObjectTooLargeError`, `BatchSubmitError` (has `accepted`/`duplicates`), `StaleDeliveryError`, `SnapshotOverflowError`.

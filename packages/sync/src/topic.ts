@@ -32,9 +32,31 @@ export type TopicConfig = {
   id: string;
   owner?: string;
   retention: RetentionConfig;
+  /**
+   * Limits of the consumer dead-letter stream. Each field defaults to the
+   * matching `retention` value. JetStream reserves `maxBytes` per stream, so a
+   * topic whose consumers rarely fail can keep this much smaller than the log.
+   */
+  deadLetterRetention?: { maxAgeMs?: number; maxBytes?: number };
   dedupeWindowMs?: number;
   maxPayloadBytes?: number;
   replicas?: number;
+};
+
+/** A topic that exists on the broker, as listed by `sync.listTopics()`. */
+export type TopicInventoryEntry = {
+  id: string;
+  owner: string;
+  messages: number;
+  bytes: number;
+  /** Configured byte limit of the event stream. */
+  maxBytes: number;
+  replicas: number;
+  firstSequence: number;
+  lastSequence: number;
+  /** Time of the newest retained event; null when the stream retains none. */
+  lastPublishedAt: Date | null;
+  createdAt: Date;
 };
 
 /** Opaque, resource-bound cursor: identifies this topic and a stream sequence. */
@@ -180,6 +202,13 @@ export type Topic<T> = {
     signal?: AbortSignal;
   }): AsyncIterable<TopicEvent<T>>;
   follow(options?: { tenantId?: string; after?: TopicCursor; signal?: AbortSignal }): AsyncIterable<TopicEvent<T>>;
+  /**
+   * Irreversibly delete this topic's event and dead-letter streams (with their
+   * consumers) without provisioning anything. Retires every handle of this
+   * declaration in the process; declare the topic again to recreate it.
+   * `destroyed` is false when neither stream existed.
+   */
+  destroy(): Promise<{ destroyed: boolean }>;
   process(
     options: TopicProcessOptions,
     handler: (event: TopicEvent<T> & { attempt: number; signal: AbortSignal }) => Promise<void>,
@@ -203,10 +232,9 @@ const gapError = (identity: ResourceIdentity, requestedSeq: number, firstRetaine
 /** next() that resolves "idle" after idleMs while keeping the pending pull alive across races. */
 const withIdleTimeout = (
   iterator: AsyncIterator<JsMsg>,
-  idleMs: number,
-): (() => Promise<IteratorResult<JsMsg> | "idle">) => {
+): ((idleMs: number) => Promise<IteratorResult<JsMsg> | "idle">) => {
   let pending: Promise<IteratorResult<JsMsg>> | null = null;
-  return async () => {
+  return async (idleMs) => {
     pending ??= iterator.next();
     const winner = await Promise.race([pending, Bun.sleep(idleMs).then(() => "idle" as const)]);
     if (winner !== "idle") pending = null;
@@ -230,12 +258,27 @@ const parseCursor = (identity: ResourceIdentity, cursor: TopicCursor, label: str
 // Topic factory
 // ==========================
 
-export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recoveries: TopicRecoveries = new Map(), onProcess: () => void = () => {}): Topic<T> => {
+export const createTopic = <T>(
+  runtime: SyncRuntime,
+  config: TopicConfig,
+  recoveries: TopicRecoveries = new Map(),
+  onProcess: () => void = () => {},
+  onDestroy: () => void = () => {},
+): Topic<T> => {
   const identity = resourceIdentity(runtime.namespace, "topic", config.id);
   const owner = config.owner ?? runtime.application;
   const retention = assertRetention(config.retention);
   const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
   const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
+  const deadLetterRetention = assertRetention({
+    maxAgeMs: config.deadLetterRetention?.maxAgeMs ?? retention.maxAgeMs,
+    maxBytes: config.deadLetterRetention?.maxBytes ?? retention.maxBytes,
+  });
+  if (config.deadLetterRetention?.maxBytes !== undefined && deadLetterRetention.maxBytes < maxPayloadBytes + DLQ_HEADROOM_BYTES) {
+    throw new RangeError(
+      `deadLetterRetention.maxBytes must hold at least one dead letter (${maxPayloadBytes + DLQ_HEADROOM_BYTES} bytes)`,
+    );
+  }
   const replicas = config.replicas ?? runtime.defaults.replicas;
   const storage = toStorageType(runtime.defaults.storage);
 
@@ -253,7 +296,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   const declaration = runtime.declare({
     identity,
     owner,
-    configKey: JSON.stringify(["topic", config.id, owner, retention, dedupeWindowMs, maxPayloadBytes, replicas]),
+    configKey: JSON.stringify(["topic", config.id, owner, retention, deadLetterRetention, dedupeWindowMs, maxPayloadBytes, replicas]),
     natsNames: [stream, dlqStream],
     maxMessageBytes: maxPayloadBytes + DLQ_HEADROOM_BYTES,
     provision: async (ctx: ProvisionContext) => {
@@ -278,8 +321,8 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
         discard: DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
-        max_age: nanos(retention.maxAgeMs),
-        max_bytes: retention.maxBytes,
+        max_age: nanos(deadLetterRetention.maxAgeMs),
+        max_bytes: deadLetterRetention.maxBytes,
         max_msgs: -1,
         max_msg_size: -1,
         duplicate_window: nanos(dedupeWindowMs),
@@ -299,6 +342,35 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
     },
   });
 
+  let destroyed = false;
+  const ensureReady = async (): Promise<void> => {
+    if (destroyed) throw new SyncUsageError(`topic ${config.id} was destroyed; declare it again to recreate it`);
+    await declaration.ready();
+  };
+
+  const destroy: Topic<T>["destroy"] = async () => {
+    runtime.assertActive();
+    destroyed = true;
+    // Forget the declaration first: a later global ready() must never
+    // re-provision the retired streams.
+    declaration.retire();
+    onDestroy();
+    const ctx = await runtime.context();
+    let removed = false;
+    for (const name of [stream, dlqStream]) {
+      const info = await ctx.jsm.streams.info(name).catch((error: unknown) => {
+        if (/stream not found/i.test(asError(error).message)) return null;
+        throw error;
+      });
+      if (info === null) continue;
+      if (info.config.metadata?.["sync.identity_sha256"] !== identity.identitySha256) {
+        throw new SyncUsageError(`topic ${config.id}: ${name} is not this topic's stream; refusing to delete it`);
+      }
+      removed = (await ctx.jsm.streams.delete(name)) || removed;
+    }
+    return { destroyed: removed };
+  };
+
   const toEvent = (envelope: Envelope, seq: number): TopicEvent<T> => ({
     data: envelope.data as T,
     eventId: extString(envelope, "eventId") ?? String(seq),
@@ -312,7 +384,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
 
   const publish: Topic<T>["publish"] = async (input) => {
     runtime.assertActive();
-    await declaration.ready();
+    await ensureReady();
     const tenantId = input.tenantId ?? DEFAULT_TENANT;
     const messageId = input.idempotencyKey
       ? `k.${subjectToken(tenantId, "tenantId")}.${subjectToken(input.idempotencyKey, "idempotencyKey")}`
@@ -359,7 +431,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   };
 
   const latestCursor: Topic<T>["latestCursor"] = async (options = {}) => {
-    await declaration.ready();
+    await ensureReady();
     const ctx = await runtime.context();
     // getMessage maps "no message found" to null in NATS.js 3.4.
     const msg = await ctx.jsm.streams.getMessage(stream, {
@@ -369,7 +441,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   };
 
   const head: Topic<T>["head"] = async () => {
-    await declaration.ready();
+    await ensureReady();
     const ctx = await runtime.context();
     return cursorOf(identity, (await ctx.jsm.streams.info(stream)).state.last_seq);
   };
@@ -383,7 +455,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
 
   async function* liveIterator(tenantId: string, signal?: AbortSignal): AsyncGenerator<TopicLiveEvent<T>> {
     runtime.assertActive();
-    await declaration.ready();
+    await ensureReady();
     if (signal?.aborted) return;
     const sub = runtime.nc.subscribe(eventSubject(tenantId));
     runtime.registerLiveSubscription(sub);
@@ -421,11 +493,17 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   }
 
   /**
-   * Durable-log read shared by replay() and follow(). Reads the stream without
-   * a server-side subject filter so stream sequences stay contiguous: any gap
-   * proves messages were removed and is reported explicitly. When the log is
-   * idle, a watchdog re-checks the stream so gaps caused by retention (rather
-   * than observed via a delivered message) surface instead of hanging.
+   * Durable-log read shared by replay() and follow(). The consumer filters on
+   * the tenant's subject on the server, so a tenant read never streams other
+   * tenants' events. Other tenants' sequences sit between two of this
+   * tenant's events, so contiguity no longer proves completeness. A limits
+   * stream only ever loses its front (age, bytes, message count), so
+   * completeness is proven against the retained window instead: every
+   * delivered batch that skips sequences is checked against the stream's
+   * first sequence before it is yielded. While the tenant is idle, a watchdog
+   * advances the proven position to the stream head once the consumer has
+   * nothing pending, so an idle reader does not fall behind the window just
+   * because other tenants wrote.
    */
   async function* logIterator(options: {
     tenantId: string;
@@ -435,22 +513,31 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
     signal?: AbortSignal;
   }): AsyncGenerator<TopicEvent<T>> {
     runtime.assertActive();
-    await declaration.ready();
+    await ensureReady();
     if (options.signal?.aborted) return;
     const ctx = await runtime.context();
-    const info = await ctx.jsm.streams.info(stream);
-    const firstSeq = info.state.first_seq;
-    const lastSeq = info.state.last_seq;
+    const subject = eventSubject(options.tenantId);
+    const state = (await ctx.jsm.streams.info(stream)).state;
 
     const afterSeq = options.after === undefined ? null : parseCursor(identity, options.after, "after");
-    const startSeq = afterSeq === null ? firstSeq : afterSeq + 1;
-    if (afterSeq !== null && startSeq < firstSeq) {
-      throw gapError(identity, startSeq, firstSeq);
+    // Removed sequences after the cursor may have belonged to this tenant;
+    // Sync cannot tell, so any removal past the cursor is reported.
+    if (afterSeq !== null && afterSeq + 1 < state.first_seq) {
+      throw gapError(identity, afterSeq + 1, state.first_seq);
     }
-    const untilSeq = options.until === undefined ? lastSeq : parseCursor(identity, options.until, "until");
-    if (!options.follow && (untilSeq < startSeq || lastSeq === 0)) return;
+    // A brand-new stream reports first_seq 0; the first real sequence is 1.
+    const startSeq = afterSeq === null ? Math.max(state.first_seq, 1) : afterSeq + 1;
+    let target = Number.POSITIVE_INFINITY;
+    if (!options.follow) {
+      const untilSeq = options.until === undefined ? state.last_seq : parseCursor(identity, options.until, "until");
+      // getMessage maps "no message found" to null in NATS.js 3.4.
+      const latest = await ctx.jsm.streams.getMessage(stream, { last_by_subj: subject });
+      target = latest === null ? 0 : Math.min(untilSeq, latest.seq);
+      if (target < startSeq) return;
+    }
 
     const consumer = await ctx.js.consumers.get(stream, {
+      filter_subjects: [subject],
       deliver_policy: startSeq <= 1 ? DeliverPolicy.All : DeliverPolicy.StartSequence,
       ...(startSeq > 1 ? { opt_start_seq: startSeq } : {}),
     });
@@ -458,52 +545,57 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
     const onAbort = (): void => messages.stop();
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
-    // A brand-new stream reports first_seq 0; the first real sequence is 1.
-    let expectedSeq = Math.max(startSeq, firstSeq, 1);
-    // Without an explicit cursor the caller asked for "earliest available":
-    // the first delivered sequence fixes the baseline (retention may advance
-    // between the info call and delivery).
-    let baselineFixed = afterSeq !== null;
-    const next = withIdleTimeout(messages[Symbol.asyncIterator](), 5_000);
+    // Every tenant event at or below `proven` was delivered or never existed.
+    // Without a cursor the caller asked for "earliest available": the first
+    // delivered event (or an idle scan) fixes the baseline instead.
+    let proven: number | null = afterSeq;
+    const verify = async (through: number): Promise<void> => {
+      const first = (await ctx.jsm.streams.info(stream)).state.first_seq;
+      if (proven !== null && first > proven + 1) throw gapError(identity, proven + 1, first);
+      proven = Math.max(proven ?? 0, through);
+    };
+    const next = withIdleTimeout(messages[Symbol.asyncIterator]());
     try {
       while (true) {
-        const winner = await next();
+        const winner = await next(5_000);
         if (winner === "idle") {
           if (options.signal?.aborted) return;
-          const state = (await ctx.jsm.streams.info(stream)).state;
-          if (state.first_seq > expectedSeq) {
-            if (!baselineFixed) {
-              // No cursor was requested: "earliest available" simply moved.
-              expectedSeq = state.first_seq;
-              continue;
-            }
-            // The events we are waiting for were removed while nothing new
-            // arrived to make the gap observable through a delivered message.
-            throw gapError(identity, expectedSeq, state.first_seq);
-          }
+          // Read the head BEFORE the consumer's pending count: every event at
+          // or below that head was stored before the count was taken.
+          const current = (await ctx.jsm.streams.info(stream)).state;
+          if (proven !== null && current.first_seq > proven + 1) throw gapError(identity, proven + 1, current.first_seq);
+          // Idle means nothing was buffered locally for the whole interval.
+          if ((await consumer.info()).num_pending === 0) proven = Math.max(proven ?? 0, current.last_seq);
           continue;
         }
         if (winner.done === true) return;
-        const msg = winner.value;
-        if (!baselineFixed) {
-          expectedSeq = msg.seq;
-          baselineFixed = true;
+        // Drain what is already buffered so one window check covers the batch.
+        const batch: JsMsg[] = [winner.value];
+        while (batch.length < 256 && messages.getPending() > 0) {
+          const buffered = await next(0);
+          if (buffered === "idle" || buffered.done === true) break;
+          batch.push(buffered.value);
         }
-        if (msg.seq > expectedSeq) {
-          // Contiguity broken: messages were removed while reading.
-          throw gapError(identity, expectedSeq, msg.seq);
+        const inRange = batch.filter((msg) => msg.seq <= target);
+        if (inRange.length > 0) {
+          const last = inRange[inRange.length - 1]!.seq;
+          if (proven === null) proven = inRange[0]!.seq - 1;
+          const contiguous = inRange.every((msg, index) => msg.seq === proven! + 1 + index);
+          if (contiguous) proven = last;
+          else await verify(last);
+          for (const msg of inRange) {
+            let envelope: Envelope | null = null;
+            try {
+              envelope = decodeEnvelope(msg.data);
+            } catch {
+              envelope = null;
+            }
+            if (envelope !== null && envelope.tenantId === options.tenantId) {
+              yield toEvent(envelope, msg.seq);
+            }
+          }
         }
-        expectedSeq = msg.seq + 1;
-        let envelope: Envelope | null = null;
-        try {
-          envelope = decodeEnvelope(msg.data);
-        } catch {
-          envelope = null;
-        }
-        if (envelope !== null && envelope.tenantId === options.tenantId) {
-          yield toEvent(envelope, msg.seq);
-        }
-        if (!options.follow && msg.seq >= untilSeq) return;
+        if (!options.follow && (inRange.length < batch.length || batch[batch.length - 1]!.seq >= target)) return;
       }
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
@@ -544,7 +636,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   const process: Topic<T>["process"] = async (options, handler) => {
     runtime.assertActive();
     assertName(options.consumer, "consumer");
-    await declaration.ready();
+    await ensureReady();
     const ctx = await runtime.context();
     const delivery = resolveDelivery(options.delivery);
     const tenantId = options.tenantId ?? DEFAULT_TENANT;
@@ -719,7 +811,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
 
   const publishBatch: Topic<T>["publishBatch"] = async (input) => {
     runtime.assertActive();
-    await declaration.ready();
+    await ensureReady();
     if (input.events.length === 0 || input.events.length > 1_000) {
       throw new SyncUsageError("publishBatch takes 1 to 1000 events");
     }
@@ -781,7 +873,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   const pauseConsumer: Topic<T>["pauseConsumer"] = async (input) => {
     runtime.assertActive();
     assertName(input.consumer, "consumer");
-    await declaration.ready();
+    await ensureReady();
     const ctx = await runtime.context();
     const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
     const until = new Date(Date.now() + (input.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
@@ -799,7 +891,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   const resumeConsumer: Topic<T>["resumeConsumer"] = async (input) => {
     runtime.assertActive();
     assertName(input.consumer, "consumer");
-    await declaration.ready();
+    await ensureReady();
     const ctx = await runtime.context();
     const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
     try {
@@ -841,7 +933,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
   };
   const deadLetters: TopicDeadLetterStore<T> = {
     list: async (options = {}) => {
-      await declaration.ready();
+      await ensureReady();
       const limit = options.limit ?? 100;
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new SyncUsageError("topic DLQ limit must be between 1 and 1000");
       const start = options.after === undefined ? 1 : deadLetterSequence(options.after) + 1;
@@ -862,14 +954,14 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
     },
     get: async ({ messageId }) => {
       const sequence = deadLetterSequence(messageId);
-      await declaration.ready();
+      await ensureReady();
       const ctx = await runtime.context();
       const msg = await ctx.jsm.streams.getMessage(dlqStream, { seq: sequence });
       return msg === null ? null : toDeadLetter(msg.seq, decodeEnvelope(msg.data));
     },
     delete: async ({ messageId }) => {
       const sequence = deadLetterSequence(messageId);
-      await declaration.ready();
+      await ensureReady();
       const ctx = await runtime.context();
       return ctx.jsm.streams.deleteMessage(dlqStream, sequence);
     },
@@ -1113,7 +1205,8 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
 
   return {
     deadLetters,
-    ready: () => declaration.ready(),
+    destroy,
+    ready: () => ensureReady(),
     publish,
     publishBatch,
     latestCursor,
@@ -1129,3 +1222,49 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig, recove
     resumeConsumer,
   };
 };
+
+// ==========================
+// Broker inventory
+// ==========================
+
+/**
+ * Topics of this namespace that exist on the broker, read from stream
+ * metadata. Never provisions or declares anything. Only the event stream of a
+ * topic is listed; its dead-letter stream shares the identity.
+ */
+export async function* listTopics(
+  runtime: SyncRuntime,
+  options: { idPrefix?: string; signal?: AbortSignal } = {},
+): AsyncGenerator<TopicInventoryEntry> {
+  runtime.assertActive();
+  const ctx = await runtime.context();
+  const nsToken = resourceIdentity(runtime.namespace, "topic", "inventory").subjectNsHash;
+  // The server narrows the list to topic event streams of this namespace.
+  for await (const info of await ctx.jsm.streams.list(`sync.v6.${nsToken}.topic.*.t.*.event`)) {
+    options.signal?.throwIfAborted();
+    const metadata = info.config.metadata;
+    const id = metadata?.["sync.id"];
+    if (
+      metadata?.["sync.managed"] !== "true" ||
+      metadata["sync.namespace"] !== runtime.namespace ||
+      metadata["sync.kind"] !== "topic" ||
+      id === undefined ||
+      !id.startsWith(options.idPrefix ?? "") ||
+      info.config.name !== streamName(resourceIdentity(runtime.namespace, "topic", id))
+    ) {
+      continue;
+    }
+    yield {
+      id,
+      owner: metadata["sync.owner"] ?? "",
+      messages: info.state.messages,
+      bytes: info.state.bytes,
+      maxBytes: info.config.max_bytes,
+      replicas: info.config.num_replicas,
+      firstSequence: info.state.first_seq,
+      lastSequence: info.state.last_seq,
+      lastPublishedAt: info.state.messages > 0 ? new Date(info.state.last_ts) : null,
+      createdAt: new Date(info.created),
+    };
+  }
+}

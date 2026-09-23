@@ -170,7 +170,13 @@ await events.process({ consumer: "search-indexer", concurrency: 4 }, async (even
 
 Cursors are opaque and resource-bound (`CursorMismatchError` elsewhere). If a cursor points below the retained window — in `replay()`, `follow()`, or a fresh `process({ start: { after } })` consumer — Sync throws `RetentionGapError` instead of silently skipping; its `resumeAfter` cursor resumes from the first retained event without losing it. `live()` events carry no cursor and are suitable for invalidate-then-read, not as durable acceptance evidence.
 
-`tenantId` on replay/follow is a client-side filter, not a partition — a tenant-scoped read streams the whole topic (all tenants) from the server; for high-volume multi-tenant logs prefer one topic per tenant or a durable `process()` consumer.
+`tenantId` on replay/follow is filtered on the server: a tenant-scoped read receives only that tenant's events, however many other tenants share the topic. That makes **one topic with `tenantId` per entity** the recommended shape for per-entity logs (documents, records, mailboxes). JetStream reserves every stream's `maxBytes` (times replicas) against the account, so a topic per entity multiplies the reservation by the number of entities; a shared topic keeps it constant.
+
+Gap detection on a shared topic: a limits stream only loses its front (age, bytes, message count). A tenant read reports `RetentionGapError` when the stream no longer retains the position right after your cursor, because Sync cannot tell whether the removed events belonged to your tenant. Other tenants' events between yours are never a gap, and an idle `follow()` keeps its position current while others write. A cursor that is only persisted when *its own tenant* changes therefore goes stale once the window passes it. Keep persisted per-tenant cursors fresh: read `head()` **before** `latestCursor({ tenantId })`; once you have applied the tenant's events up to that latest cursor, you may persist the `head()` cursor instead (the tenant has no events in between). Refresh idle tenants the same way before the retained window reaches their cursor.
+
+`sync.listTopics({ idPrefix })` lists topics of the namespace that exist on the broker (not only the ones declared in this process), and `topic.destroy()` deletes a topic's event and dead-letter streams without provisioning anything. Together they retire old per-entity topics after their events are captured elsewhere.
+
+`deadLetterRetention: { maxAgeMs?, maxBytes? }` sizes the consumer dead-letter stream independently; both default to `retention`. Its `maxBytes` must hold one dead letter (payload limit plus 4 KiB).
 
 Topic DLQ entries can be inspected and deleted through `deadLetters`; opt-in recovery targets only the original consumer.
 
