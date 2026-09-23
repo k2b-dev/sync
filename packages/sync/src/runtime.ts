@@ -7,6 +7,7 @@ import {
   ConflictingResourceDeclarationError,
   ResourceDriftError,
   SyncLifecycleError,
+  SyncUsageError,
   UnsupportedServerError,
   asError,
 } from "./errors.ts";
@@ -86,6 +87,8 @@ type DeclarationEntry = Declaration & {
   state: "pending" | "ready" | "drifted" | "failed";
   error?: Error;
   inflight?: Promise<void>;
+  /** Destroyed on the broker; handles sharing this entry must not re-provision it. */
+  retired?: boolean;
 };
 
 export type SyncRuntime = {
@@ -98,7 +101,7 @@ export type SyncRuntime = {
   ready(): Promise<void>;
   /** The shared provision/client context. Only valid after ready(). */
   context(): Promise<ProvisionContext>;
-  declare(declaration: Declaration): { ready(): Promise<void> };
+  declare(declaration: Declaration): { ready(): Promise<void>; retire(): void };
   registerWorker(worker: WorkerRuntime): void;
   unregisterWorker(worker: WorkerRuntime): void;
   /** Core NATS subscriptions created by Sync (topic.live) — drained on sync.drain(). */
@@ -268,7 +271,7 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     }
   };
 
-  const declare = (declaration: Declaration): { ready(): Promise<void> } => {
+  const declare = (declaration: Declaration): { ready(): Promise<void>; retire(): void } => {
     assertActive();
     const key = `${declaration.identity.kind}:${declaration.identity.id}`;
     const existing = declarations.get(key);
@@ -278,14 +281,22 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
           `${declaration.identity.kind} ${declaration.identity.id} is already declared in this process with a different configuration`,
         );
       }
-      return { ready: () => entryReady(existing) };
+      return { ready: () => entryReady(existing), retire: () => retire(key, existing) };
     }
     const entry: DeclarationEntry = { ...declaration, state: "pending" };
     declarations.set(key, entry);
-    return { ready: () => entryReady(entry) };
+    return { ready: () => entryReady(entry), retire: () => retire(key, entry) };
+  };
+
+  const retire = (key: string, entry: DeclarationEntry): void => {
+    entry.retired = true;
+    if (declarations.get(key) === entry) declarations.delete(key);
   };
 
   const entryReady = async (entry: DeclarationEntry): Promise<void> => {
+    if (entry.retired) {
+      throw new SyncUsageError(`${entry.identity.kind} ${entry.identity.id} was destroyed; declare it again to recreate it`);
+    }
     // Already-provisioned declarations stay usable during drain so in-flight
     // handlers can settle (checkpoint, ack); only new provisioning is refused.
     if (entry.state === "ready") return;

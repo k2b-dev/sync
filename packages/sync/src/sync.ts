@@ -15,8 +15,8 @@ import { createQueue } from "./queue.ts";
 import type { DeadLetterStore, Queue, QueueConfig } from "./queue.ts";
 import { createScheduler } from "./scheduler.ts";
 import type { ScheduleInfo, Scheduler, SchedulerConfig } from "./scheduler.ts";
-import { createTopic } from "./topic.ts";
-import type { Topic, TopicConfig, TopicDeadLetterStore, TopicRecoveries } from "./topic.ts";
+import { createTopic, listTopics } from "./topic.ts";
+import type { Topic, TopicConfig, TopicDeadLetterStore, TopicInventoryEntry, TopicRecoveries } from "./topic.ts";
 
 /** Controls for resources declared in this process. Identity includes kind. */
 export type SyncControl = Readonly<{ namespace: string; id: string; owner: string } & (
@@ -39,6 +39,12 @@ export type Sync = {
   events(options?: { signal?: AbortSignal }): AsyncIterable<SyncEvent>;
 
   topic<T>(config: TopicConfig): Topic<T>;
+  /**
+   * Topics of this namespace that exist on the broker (not only those
+   * declared in this process), filtered by id prefix. Performs no
+   * provisioning. Use it to find per-entity topics to retire with destroy().
+   */
+  listTopics(options?: { idPrefix?: string; signal?: AbortSignal }): AsyncIterable<TopicInventoryEntry>;
   queue<T>(config: QueueConfig): Queue<T>;
   job<Input>(config: JobConfig): Job<Input>;
   ephemeral<T>(config: EphemeralConfig): Ephemeral<T>;
@@ -68,12 +74,22 @@ export const createSync = (config: SyncConfig): Sync => {
     events: (options) => runtime.events.subscribe(options),
     topic: <T>(topicConfig: TopicConfig) => {
       const recoveries: TopicRecoveries = topicRecoveries.get(topicConfig.id) ?? new Map();
-      const handle = createTopic<T>(runtime, topicConfig, recoveries, () => {
-        controls.set(`topic:${topicConfig.id}`, { ...identity(topicConfig.id, topicConfig.owner), kind: "topic", deadLetters: handle.deadLetters });
-      });
+      const handle = createTopic<T>(
+        runtime,
+        topicConfig,
+        recoveries,
+        () => {
+          controls.set(`topic:${topicConfig.id}`, { ...identity(topicConfig.id, topicConfig.owner), kind: "topic", deadLetters: handle.deadLetters });
+        },
+        () => {
+          controls.delete(`topic:${topicConfig.id}`);
+          topicRecoveries.delete(topicConfig.id);
+        },
+      );
       topicRecoveries.set(topicConfig.id, recoveries);
       return handle;
     },
+    listTopics: (options) => listTopics(runtime, options),
     queue: <T>(queueConfig: QueueConfig) => {
       const handle = createQueue<T>(runtime, queueConfig);
       controls.set(`queue:${queueConfig.id}`, { ...identity(queueConfig.id, queueConfig.owner), kind: "queue", deadLetters: handle.deadLetters });
