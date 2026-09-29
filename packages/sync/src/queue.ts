@@ -198,6 +198,12 @@ const fullStreamLimit = (error: unknown): "maxBytes" | "maxMessages" | null => {
   return null;
 };
 
+/**
+ * NATS.js throws this when the server answered a batch commit with an error
+ * instead of an ack, and drops the server's reason. Nothing was committed.
+ */
+const REFUSED_BATCH_COMMIT = "batch didn't contain number of published messages";
+
 export const createQueueCore = <T, D = T>(
   runtime: SyncRuntime,
   config: QueueConfig & {
@@ -491,10 +497,10 @@ export const createQueueCore = <T, D = T>(
       }
       const limit = fullStreamLimit(error);
       if (limit !== null) throw storeFull(limit, error);
-      if (whenFull === "reject") {
-        // NATS.js reports a refused commit only as a count mismatch and drops
-        // the server's reason. Nothing was committed; name a full stream when
-        // the batch cannot fit its remaining room.
+      if (whenFull === "reject" && asError(error).message === REFUSED_BATCH_COMMIT) {
+        // Name a full stream when the refused batch cannot fit its remaining
+        // room. Other failures, such as a lost commit ack, have an unknown
+        // outcome and pass through unchanged.
         const info = await ctx.jsm.streams.info(stream).catch(() => null);
         const batchBytes = prepared.reduce((sum, entry) => sum + entry.byteLength, 0);
         if (info !== null && info.state.bytes + batchBytes > info.config.max_bytes) throw storeFull("maxBytes", error);

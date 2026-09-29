@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { jetstreamManager } from "@nats-io/jetstream";
 import type { StreamConfig } from "@nats-io/jetstream";
+import { TimeoutError } from "@nats-io/nats-core";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync } from "../src/sync.ts";
 import type { Sync } from "../src/sync.ts";
@@ -133,6 +134,42 @@ describe("whenFull: reject", () => {
     await worker.drain();
     // Room again once the work is done.
     expect((await queue.send({ data: "after" })).duplicate).toBe(false);
+  }, 30_000);
+
+  test("a batch whose commit ack is lost is not reported as refused", async () => {
+    // The commit reaches the server, but its ack never arrives (for example
+    // during a leader change). Its outcome is unknown, not a full store.
+    const lostCommitAck = new Proxy(nc, {
+      get(target, property) {
+        if (property === "request") {
+          return async (...args: Parameters<NatsConnection["request"]>) => {
+            const reply = await target.request(...args);
+            if (args[2]?.headers?.get("Nats-Batch-Commit") === "1") throw new TimeoutError();
+            return reply;
+          };
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const lossy = createSync({ connection: lostCommitAck, namespace, application: "tests" });
+    const id = uniqueName("reject-lost-ack");
+    const config = { id, whenFull: "reject" as const, maxPayloadBytes: 4_096, retention: { maxAgeMs: 3_600_000, maxBytes: 16 * 1024 } };
+    const queue = lossy.queue<string>(config);
+    await queue.send({ data: "a".repeat(3_000) });
+    await queue.send({ data: "b".repeat(3_000) });
+    // The committed batch fits, but the stored bytes plus the batch again do not.
+    const error = await queue.sendBatch([{ data: "c".repeat(3_000) }, { data: "d".repeat(3_000) }]).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(TimeoutError);
+    await lossy.drain({ timeoutMs: 1_000 });
+
+    const handled: string[] = [];
+    const worker = await sync.queue<string>(config).process({ concurrency: 4 }, async (message) => {
+      handled.push(message.data[0]!);
+    });
+    await waitFor(() => handled.length >= 4, 15_000);
+    await worker.drain();
+    expect(handled.toSorted()).toEqual(["a", "b", "c", "d"]);
   }, 30_000);
 
   test("retention.maxMessages refuses the next message", async () => {
