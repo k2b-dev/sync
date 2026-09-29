@@ -97,7 +97,7 @@ const j = sync.job<Input>({
   ...QueueConfig,                // incl. retention, whenFull; resubmit({ delayMs }) throws under "reject",
                                  // and at the limit a continuation cannot be published
                                  // (plain: handler reruns, then DLQ; coalesced: waits for room)
-  terminalRetentionMs?,          // DLQ age, default 7d
+  terminalRetentionMs?,          // DLQ age, positive integer, default 7d
   deadLetterRetention?,          // { maxBytes? } only; defaults to retention.maxBytes
 });
 

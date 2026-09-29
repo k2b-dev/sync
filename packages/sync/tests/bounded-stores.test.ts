@@ -91,6 +91,10 @@ describe("default and dead-letter limits", () => {
     const { work, deadLetters } = await streamsOf("job", id);
     expect(work.max_bytes).toBe(256 * (128 * 1024 + DLQ_HEADROOM_BYTES));
     expect([deadLetters.max_bytes, deadLetters.max_age]).toEqual([1024 ** 2, nanos(600_000)]);
+    // 6.x passed 0 through as "no age limit"; the dead-letter age is now always bounded.
+    expect(() => sync.job<string>({ id: uniqueName("job-dlq-age"), terminalRetentionMs: 0 })).toThrow(
+      "terminalRetentionMs must be a positive integer",
+    );
   }, 30_000);
 });
 

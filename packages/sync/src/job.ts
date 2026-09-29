@@ -124,6 +124,9 @@ type LegacyClaim = { pending?: boolean; jobId?: string; seq?: number };
 
 export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<Input> => {
   const terminalRetentionMs = config.terminalRetentionMs ?? DEFAULT_WORK_MAX_AGE_MS;
+  if (!Number.isSafeInteger(terminalRetentionMs) || terminalRetentionMs <= 0) {
+    throw new RangeError("terminalRetentionMs must be a positive integer");
+  }
   const retentionMs = config.retention?.maxAgeMs ?? DEFAULT_WORK_MAX_AGE_MS;
   const claimRetentionMs = Math.max(retentionMs, config.delivery?.ackWaitMs ?? 30_000);
   // Input still passes the ordinary work-envelope limit. Persisted coordination
