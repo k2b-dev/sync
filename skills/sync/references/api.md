@@ -94,7 +94,9 @@ await q.deadLetters.delete({ messageId });                       // boolean
 
 ```ts
 const j = sync.job<Input>({
-  ...QueueConfig,                // incl. retention, whenFull; resubmit({ delayMs }) throws under "reject"
+  ...QueueConfig,                // incl. retention, whenFull; resubmit({ delayMs }) throws under "reject",
+                                 // and at the limit a continuation cannot be published
+                                 // (plain: handler reruns, then DLQ; coalesced: waits for room)
   terminalRetentionMs?,          // DLQ age, default 7d
   deadLetterRetention?,          // { maxBytes? } only; defaults to retention.maxBytes
 });
