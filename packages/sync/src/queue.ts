@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { headers as natsHeaders } from "@nats-io/nats-core";
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, JetStreamApiError, RetentionPolicy } from "@nats-io/jetstream";
 import type { JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
-import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
+import { NotFoundError, StoreFullError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { SyncResourceKind } from "./naming.ts";
 import { ensureConsumer, ensureStream, setConsumerPause, toStorageType } from "./resources.ts";
@@ -18,6 +18,7 @@ import {
   DEFAULT_TENANT,
   assertRetention,
   backoffDelayMs,
+  defaultWorkRetention,
   nanos,
   resolveDelivery,
 } from "./types.ts";
@@ -33,7 +34,29 @@ export type QueueConfig = {
   id: string;
   owner?: string;
   delivery?: DeliveryConfig;
+  /**
+   * Work stream limits. Default 7 days and 256 messages at the payload limit
+   * (33 MiB at the 128 KiB default, never more than 1 GiB).
+   */
   retention?: RetentionConfig;
+  /**
+   * Limits of the dead-letter stream. Each field defaults to the matching
+   * `retention` value; `maxBytes` must hold one dead letter (payload limit
+   * plus 4 KiB). JetStream reserves `maxBytes` per stream, so work that rarely
+   * fails can keep this much smaller than the work stream.
+   */
+  deadLetterRetention?: { maxAgeMs?: number; maxBytes?: number };
+  /**
+   * What the work stream does at `retention.maxBytes` or `maxMessages`:
+   * - `"discard_oldest"` (default): every send is accepted and the oldest
+   *   pending work is silently removed.
+   * - `"reject"`: new work fails with `StoreFullError` and accepted work is
+   *   kept. NATS cannot schedule messages on such a stream, so `delayMs` and
+   *   `at` are unavailable. An existing stream cannot switch in place.
+   *
+   * `retention.maxAgeMs` expires pending work in both modes.
+   */
+  whenFull?: "discard_oldest" | "reject";
   /** One stream-level NATS duplicate window. Default 120_000. */
   dedupeWindowMs?: number;
   ordering?: OrderingConfig;
@@ -167,10 +190,17 @@ const partitionOf = (orderingKey: string, partitions: number): number => {
 const scopedMessageId = (tenantId: string, key: string): string =>
   `k.${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "idempotencyKey")}`;
 
+/** JetStream refused a publish because a DiscardNew stream reached a limit. */
+const fullStreamLimit = (error: unknown): "maxBytes" | "maxMessages" | null => {
+  if (!(error instanceof JetStreamApiError) || error.code !== 10077) return null;
+  if (/maximum bytes exceeded/i.test(error.message)) return "maxBytes";
+  if (/maximum messages exceeded/i.test(error.message)) return "maxMessages";
+  return null;
+};
+
 export const createQueueCore = <T, D = T>(
   runtime: SyncRuntime,
   config: QueueConfig & {
-    dlqMaxAgeMs?: number;
     /** Additional resources provisioned with this declaration (job claims KV). */
     provisionExtra?: (ctx: ProvisionContext) => Promise<void>;
     extraNatsNames?: string[];
@@ -189,9 +219,22 @@ export const createQueueCore = <T, D = T>(
   const identity = resourceIdentity(runtime.namespace, kind, config.id);
   const owner = config.owner ?? runtime.application;
   const delivery = resolveDelivery(config.delivery);
-  const retention = assertRetention(config.retention ?? { maxAgeMs: 7 * 24 * 60 * 60 * 1_000, maxBytes: 1024 ** 3 });
-  const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
   const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
+  const retention = assertRetention(config.retention ?? defaultWorkRetention(maxPayloadBytes));
+  const deadLetterRetention = assertRetention({
+    maxAgeMs: config.deadLetterRetention?.maxAgeMs ?? retention.maxAgeMs,
+    maxBytes: config.deadLetterRetention?.maxBytes ?? retention.maxBytes,
+  });
+  if (config.deadLetterRetention?.maxBytes !== undefined && deadLetterRetention.maxBytes < maxPayloadBytes + DLQ_HEADROOM_BYTES) {
+    throw new RangeError(
+      `deadLetterRetention.maxBytes must hold at least one dead letter (${maxPayloadBytes + DLQ_HEADROOM_BYTES} bytes)`,
+    );
+  }
+  const whenFull = config.whenFull ?? "discard_oldest";
+  if (whenFull !== "discard_oldest" && whenFull !== "reject") {
+    throw new RangeError('whenFull must be "discard_oldest" or "reject"');
+  }
+  const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
   const replicas = config.replicas ?? runtime.defaults.replicas;
   const storage = toStorageType(runtime.defaults.storage);
   const ordering: OrderingConfig = config.ordering ?? { mode: "none" };
@@ -228,11 +271,12 @@ export const createQueueCore = <T, D = T>(
       owner,
       delivery,
       retention,
+      deadLetterRetention,
+      whenFull,
       dedupeWindowMs,
       ordering,
       maxPayloadBytes,
       replicas,
-      config.dlqMaxAgeMs ?? null,
     ]),
     natsNames: [stream, dlqStream, ...(config.extraNatsNames ?? [])],
     maxMessageBytes: maxPayloadBytes + DLQ_HEADROOM_BYTES,
@@ -242,11 +286,10 @@ export const createQueueCore = <T, D = T>(
         name: stream,
         subjects: [workFilter, `${root}.t.*.delay.>`],
         retention: RetentionPolicy.Workqueue,
-        // DiscardPolicy.New would be the honest failure mode at the limits,
-        // but NATS forbids it on streams with message schedules (delays live
-        // here). Retention limits are therefore a hard loss boundary for the
-        // oldest pending work — size maxBytes/maxAgeMs generously.
-        discard: DiscardPolicy.Old,
+        // NATS forbids DiscardPolicy.New on streams with message schedules,
+        // and a schedule can only target its own stream. Delays therefore
+        // exist only where the limits drop the oldest pending work.
+        discard: whenFull === "reject" ? DiscardPolicy.New : DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
         max_age: nanos(retention.maxAgeMs),
@@ -254,7 +297,8 @@ export const createQueueCore = <T, D = T>(
         max_msgs: retention.maxMessages ?? -1,
         max_msg_size: -1,
         duplicate_window: nanos(dedupeWindowMs),
-        allow_msg_schedules: true,
+        // The server omits disabled flags, so only an enabled one is declared.
+        ...(whenFull === "reject" ? {} : { allow_msg_schedules: true }),
         allow_msg_ttl: true,
         allow_atomic: true,
       });
@@ -265,8 +309,8 @@ export const createQueueCore = <T, D = T>(
         discard: DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
-        max_age: nanos(config.dlqMaxAgeMs ?? retention.maxAgeMs),
-        max_bytes: retention.maxBytes,
+        max_age: nanos(deadLetterRetention.maxAgeMs),
+        max_bytes: deadLetterRetention.maxBytes,
         max_msgs: -1,
         max_msg_size: -1,
         duplicate_window: nanos(dedupeWindowMs),
@@ -362,6 +406,9 @@ export const createQueueCore = <T, D = T>(
     const bytes = encodeEnvelope(label, envelope, maxPayloadBytes);
     const target = workSubject(tenantId, partition);
     const fireAt = message.at ?? (message.delayMs !== undefined ? new Date(Date.now() + message.delayMs) : null);
+    if (whenFull === "reject" && fireAt !== null && fireAt.getTime() > Date.now()) {
+      throw new SyncUsageError(`${label} rejects work when full; NATS cannot delay messages on such a stream (delayMs/at)`);
+    }
     if (message.ttlMs !== undefined && (!Number.isSafeInteger(message.ttlMs) || message.ttlMs < 1_000)) {
       throw new RangeError("ttlMs must be an integer of at least 1000");
     }
@@ -378,11 +425,23 @@ export const createQueueCore = <T, D = T>(
         return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
       }
       const headers = ttl !== undefined ? (() => { const h = natsHeaders(); h.set("Nats-TTL", ttl); return h; })() : undefined;
-      const ack = await ctx.js.publish(target, bytes, { msgID: messageId, ...(headers !== undefined ? { headers } : {}) });
-      return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
+      try {
+        const ack = await ctx.js.publish(target, bytes, { msgID: messageId, ...(headers !== undefined ? { headers } : {}) });
+        return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
+      } catch (error) {
+        const limit = fullStreamLimit(error);
+        if (limit !== null) throw storeFull(limit, error);
+        throw error;
+      }
     };
 
     return { messageId, bytes, byteLength: bytes.byteLength, target, delayed: fireAt !== null && fireAt.getTime() > Date.now(), ttl, publish };
+  };
+
+  const storeFull = (limit: "maxBytes" | "maxMessages", cause: unknown): StoreFullError => {
+    const error = new StoreFullError(`${label} is full (retention.${limit} reached); the work was not accepted`);
+    error.cause = cause;
+    return error;
   };
 
   const send: QueueCore<T, D>["send"] = async (message, ext) => {
@@ -429,6 +488,19 @@ export const createQueueCore = <T, D = T>(
     } catch (error) {
       if (/atomic publish is disabled/i.test(asError(error).message)) {
         throw new SyncUsageError(`${label}: the stream predates atomic batches (allow_atomic off); recreate it`);
+      }
+      const limit = fullStreamLimit(error);
+      if (limit !== null) throw storeFull(limit, error);
+      if (whenFull === "reject") {
+        // NATS.js reports a refused commit only as a count mismatch and drops
+        // the server's reason. Nothing was committed; name a full stream when
+        // the batch cannot fit its remaining room.
+        const info = await ctx.jsm.streams.info(stream).catch(() => null);
+        const batchBytes = prepared.reduce((sum, entry) => sum + entry.byteLength, 0);
+        if (info !== null && info.state.bytes + batchBytes > info.config.max_bytes) throw storeFull("maxBytes", error);
+        if (info !== null && info.config.max_msgs > 0 && info.state.messages + prepared.length > info.config.max_msgs) {
+          throw storeFull("maxMessages", error);
+        }
       }
       throw error;
     }

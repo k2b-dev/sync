@@ -44,8 +44,9 @@ type DeliveryConfig = {
   backoffMs?: number[];  // default [1_000, 5_000, 30_000, 120_000]; last entry repeats
 };
 type RetentionConfig = { maxAgeMs: number; maxBytes: number; maxMessages?: number };
-// Queue/topic retention is a hard loss boundary (discard-old; NATS forbids
-// reject-new on streams with message schedules) — size generously.
+// Topic retention and queue/job retention with whenFull "discard_oldest" drop
+// the oldest messages at the limits. Queue/job whenFull "reject" refuses new
+// work with StoreFullError instead (NATS then allows no delayMs/at).
 type OrderingConfig = { mode: "none" } | { mode: "partitioned"; partitions: number };
 type PublishReceipt = { messageId: string; streamSequence: number; duplicate: boolean };
 ```
@@ -54,7 +55,12 @@ type PublishReceipt = { messageId: string; streamSequence: number; duplicate: bo
 
 ```ts
 const q = sync.queue<T>({
-  id, owner?, delivery?, retention?,        // retention default 7d / 1 GiB
+  id, owner?, delivery?, retention?,        // retention default 7d / 256 × (maxPayloadBytes + 4 KiB), max 1 GiB
+  deadLetterRetention?,                     // { maxAgeMs?, maxBytes? }, each defaults to retention;
+                                            // maxBytes must hold one dead letter (payload limit + 4 KiB)
+  whenFull?,                                // "discard_oldest" (default) | "reject": StoreFullError at
+                                            // maxBytes/maxMessages; delayMs/at → SyncUsageError; an
+                                            // existing stream cannot switch in place (ResourceDriftError)
   dedupeWindowMs?,                          // default 120_000
   ordering?,                                // partitioned ⇒ send() requires orderingKey;
                                             // retries run in place (order survives failures;
@@ -87,7 +93,11 @@ await q.deadLetters.delete({ messageId });                       // boolean
 ## job
 
 ```ts
-const j = sync.job<Input>({ ...QueueConfig, terminalRetentionMs? /* DLQ retention, default 7d */ });
+const j = sync.job<Input>({
+  ...QueueConfig,                // incl. retention, whenFull; resubmit({ delayMs }) throws under "reject"
+  terminalRetentionMs?,          // DLQ age, default 7d
+  deadLetterRetention?,          // { maxBytes? } only; defaults to retention.maxBytes
+});
 
 await j.submit({ key, input, tenantId?, delayMs?, at?, orderingKey?, meta?, coalesce? });
 // → PublishReceipt & { jobId }; key = NATS msgID within dedupe window, per tenant.
@@ -363,7 +373,7 @@ administrative endpoints and audit mutations themselves.
 
 ## Errors
 
-`SyncError` base; `SyncLifecycleError`, `UnsupportedServerError`, `InvalidNameError` (name/bounds violations), `SyncUsageError` (API misuse: mutually exclusive options, reader on partitioned queues, foreign ObjectRef, reserved metadata, invalid cron), `NotFoundError` (missing dead letter / schedule), `ConflictingResourceDeclarationError`, `ResourceIdentityCollisionError`, `ResourceDriftError { resource, differences }`, `PayloadTooLargeError { actualBytes, maxBytes }`, `ObjectTooLargeError`, `StaleDeliveryError`, `RetentionGapError { requested, firstAvailable, resumeAfter }`, `CursorMismatchError`, `BatchSubmitError { accepted, duplicates }`, `ConflictError` (lost expectedAfter race), `SnapshotOverflowError { maxEntries }`. Config validation throws plain `RangeError`; empty namespace/application throws `SyncLifecycleError`; non-serializable payloads throw `TypeError`.
+`SyncError` base; `SyncLifecycleError`, `UnsupportedServerError`, `InvalidNameError` (name/bounds violations), `SyncUsageError` (API misuse: mutually exclusive options, reader on partitioned queues, foreign ObjectRef, reserved metadata, invalid cron), `NotFoundError` (missing dead letter / schedule), `ConflictingResourceDeclarationError`, `ResourceIdentityCollisionError`, `ResourceDriftError { resource, differences }`, `PayloadTooLargeError { actualBytes, maxBytes }`, `ObjectTooLargeError`, `StaleDeliveryError`, `RetentionGapError { requested, firstAvailable, resumeAfter }`, `CursorMismatchError`, `BatchSubmitError { accepted, duplicates }`, `StoreFullError` (queue/job with `whenFull: "reject"` at its limit; nothing accepted), `ConflictError` (lost expectedAfter race), `SnapshotOverflowError { maxEntries }`. Config validation throws plain `RangeError`; empty namespace/application throws `SyncLifecycleError`; non-serializable payloads throw `TypeError`.
 
 ## NATS feature map
 

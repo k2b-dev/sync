@@ -51,6 +51,22 @@ export const DEFAULT_EPHEMERAL_PAYLOAD_BYTES = 4 * 1024;
 export const DEFAULT_DEDUPE_WINDOW_MS = 120_000;
 export const DEFAULT_TENANT = "default";
 
+/** Retention age of a queue or job declared without `retention`. */
+export const DEFAULT_WORK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+
+/**
+ * Retention of a queue or job declared without `retention`. JetStream
+ * reserves a stream's whole `max_bytes` on every replica as soon as the
+ * stream exists, so the default byte limit holds 256 messages at the payload
+ * limit (plus dead-letter headroom): 33 MiB at the 128 KiB default, never
+ * more than 1 GiB. Typical work of a few hundred bytes still fits tens of
+ * thousands of pending messages.
+ */
+export const defaultWorkRetention = (maxPayloadBytes: number): RetentionConfig => ({
+  maxAgeMs: DEFAULT_WORK_MAX_AGE_MS,
+  maxBytes: Math.min(1024 ** 3, 256 * (maxPayloadBytes + DLQ_HEADROOM_BYTES)),
+});
+
 const assertPositiveInt = (value: number, label: string): void => {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new RangeError(`${label} must be a positive integer`);

@@ -104,6 +104,7 @@ export {
   RetentionGapError,
   SnapshotOverflowError,
   StaleDeliveryError,
+  StoreFullError,
   SyncError,
   SyncLifecycleError,
   SyncUsageError,
