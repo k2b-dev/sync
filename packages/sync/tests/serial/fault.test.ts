@@ -3,7 +3,8 @@ import type { NatsConnection, Subscription } from "@nats-io/nats-core";
 import { createSync } from "../../src/sync.ts";
 import type { Sync } from "../../src/sync.ts";
 import { StaleDeliveryError } from "../../src/errors.ts";
-import { connectToCluster, startNode, stopNode, uniqueName } from "../cluster.ts";
+import { resourceIdentity, streamName } from "../../src/naming.ts";
+import { connectToCluster, startNode, stopNode, uniqueName, waitForLeaders } from "../cluster.ts";
 import { cleanupNamespaces, testNamespace, waitFor } from "../helpers.ts";
 
 let nc: NatsConnection;
@@ -242,6 +243,8 @@ describe("node loss", () => {
 
     await stopNode(3);
     try {
+      // Failover is not instant: writes resume once new leaders are elected.
+      await waitForLeaders(conn, [streamName(resourceIdentity(namespace, "topic", "resilient"))], 3);
       // Publishing and durable processing continue on the two remaining nodes.
       for (let n = 2; n <= 6; n++) await topic.publish({ data: { n } });
       const seen: number[] = [];

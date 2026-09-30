@@ -11,7 +11,7 @@ import type { JetStreamClient, JetStreamManager } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
 import { Objm } from "@nats-io/obj";
 import type { NatsConnection } from "@nats-io/nats-core";
-import { connectToCluster, restartNode, uniqueName } from "../cluster.ts";
+import { connectToCluster, restartNode, uniqueName, waitForLeaders } from "../cluster.ts";
 
 let nc: NatsConnection;
 let js: JetStreamClient;
@@ -265,6 +265,7 @@ describe("resilience", () => {
     });
     await restartNode(node);
     await reconnected;
+    await waitForLeaders(conn, [stream]);
 
     const ack = await cjs.publish(subject, "after");
     expect(ack.seq).toBeGreaterThanOrEqual(2);
