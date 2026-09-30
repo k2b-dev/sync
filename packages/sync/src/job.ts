@@ -3,7 +3,7 @@ import type { JsMsg } from "@nats-io/jetstream";
 import { JetStreamApiError } from "@nats-io/jetstream";
 import { decodeEnvelope, decodeJson, encodeJson, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
-import { BatchSubmitError, SyncUsageError, asError } from "./errors.ts";
+import { BatchSubmitError, StoreFullError, SyncUsageError, asError } from "./errors.ts";
 import { isCasConflict, kvCasPut } from "./kv.ts";
 import { assertName, kvBucketName, resourceIdentity, streamName, subjectToken } from "./naming.ts";
 import { ensureKv, toStorageType } from "./resources.ts";
@@ -12,16 +12,22 @@ import { retry } from "./retry.ts";
 import type { BatchReceipt, DeadLetterStore, PauseInfo, QueueConfig, QueueCore } from "./queue.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import type { MessageMeta, PublishReceipt } from "./types.ts";
-import { DEFAULT_MESSAGE_PAYLOAD_BYTES, DLQ_HEADROOM_BYTES } from "./types.ts";
+import { DEFAULT_MESSAGE_PAYLOAD_BYTES, DEFAULT_WORK_MAX_AGE_MS, DLQ_HEADROOM_BYTES } from "./types.ts";
 import type { ProcessOptions, Worker } from "./worker.ts";
 
 // ==========================
 // Types
 // ==========================
 
-export type JobConfig = QueueConfig & {
+export type JobConfig = Omit<QueueConfig, "deadLetterRetention"> & {
   /** Retention for diagnostics and dead letters. Default 7 days. */
   terminalRetentionMs?: number;
+  /**
+   * Byte limit of the dead-letter stream. Defaults to `retention.maxBytes`;
+   * must hold one dead letter (payload limit plus 4 KiB). Its age is
+   * `terminalRetentionMs`.
+   */
+  deadLetterRetention?: { maxBytes?: number };
 };
 
 export type JobSubmit<Input> = {
@@ -117,8 +123,11 @@ type CoalescedClaim<Input> = {
 type LegacyClaim = { pending?: boolean; jobId?: string; seq?: number };
 
 export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<Input> => {
-  const terminalRetentionMs = config.terminalRetentionMs ?? 7 * 24 * 60 * 60 * 1_000;
-  const retentionMs = config.retention?.maxAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
+  const terminalRetentionMs = config.terminalRetentionMs ?? DEFAULT_WORK_MAX_AGE_MS;
+  if (!Number.isSafeInteger(terminalRetentionMs) || terminalRetentionMs <= 0) {
+    throw new RangeError("terminalRetentionMs must be a positive integer");
+  }
+  const retentionMs = config.retention?.maxAgeMs ?? DEFAULT_WORK_MAX_AGE_MS;
   const claimRetentionMs = Math.max(retentionMs, config.delivery?.ackWaitMs ?? 30_000);
   // Input still passes the ordinary work-envelope limit. Persisted coordination
   // fields use the same framework headroom already reserved for dead letters.
@@ -172,6 +181,21 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       { ttl: `${Math.max(1, Math.ceil((claimRetentionMs + waitingMs) / 1_000))}s` });
   };
 
+  /** Release a generation that no publication has reached yet. */
+  const releaseUnpublishedClaim = async (tenantId: string, key: string, generation: string): Promise<void> => {
+    const store = await getClaims();
+    while (true) {
+      const { claim, revision } = await loadClaim(tenantId, key);
+      if (claim === null || !("generation" in claim) || claim.generation !== generation || claim.seq !== undefined) return;
+      try {
+        await store.purge(claimKey(tenantId, key), { previousSeq: revision });
+        return;
+      } catch (error) {
+        if (!isCasConflict(error)) throw error;
+      }
+    }
+  };
+
   const generationOf = (envelope: Envelope): string =>
     extString(envelope, "coalesceGeneration") ?? extString(envelope, "messageId") ?? "";
 
@@ -205,7 +229,10 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     runtime,
     {
       ...config,
-      dlqMaxAgeMs: terminalRetentionMs,
+      deadLetterRetention: {
+        maxAgeMs: terminalRetentionMs,
+        ...(config.deadLetterRetention?.maxBytes === undefined ? {} : { maxBytes: config.deadLetterRetention.maxBytes }),
+      },
       extraNatsNames: [`KV_${claimsBucket}`],
       provisionExtra: async (ctx) => {
         claims = await ensureKv(ctx, identity, config.owner ?? runtime.application, claimsBucket, {
@@ -351,7 +378,12 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       if (revision === null) continue;
       // Leave pending input intact on an unknown publish result. A later
       // submit can finish this exact generation rather than lose the job.
-      const receipt = await publishClaim(tenantId, job.key, pending, revision, signal);
+      // A full stream refused it outright: nothing was accepted, so the key
+      // must not keep that input for a later submission to publish.
+      const receipt = await publishClaim(tenantId, job.key, pending, revision, signal).catch(async (error: unknown) => {
+        if (error instanceof StoreFullError) await releaseUnpublishedClaim(tenantId, job.key, pending.generation);
+        throw error;
+      });
       return { ...receipt, duplicate: publishKey === undefined ? false : receipt.duplicate, jobId: receipt.messageId };
     }
   };
@@ -479,6 +511,9 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       signal: message.signal,
       heartbeat: message.heartbeat,
       resubmit: (options = {}) => {
+        if (config.whenFull === "reject" && options.delayMs !== undefined && options.delayMs > 0) {
+          throw new SyncUsageError(`job ${config.id} rejects work when full; NATS cannot delay its continuations (delayMs)`);
+        }
         continuation.requested = true;
         if (options.delayMs !== undefined) continuation.delayMs = options.delayMs;
         if (options.input !== undefined) continuation.input = options.input;

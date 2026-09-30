@@ -67,6 +67,13 @@ export class ObjectTooLargeError extends SyncError {
   }
 }
 
+/**
+ * A queue or job declared with `whenFull: "reject"` reached its retention
+ * limit (`maxBytes` or `maxMessages`) and refused new work. Nothing was
+ * accepted; retry later or shed the work.
+ */
+export class StoreFullError extends SyncError {}
+
 /** NATS no longer accepts the delivery's ack token (redelivered elsewhere or expired). */
 export class StaleDeliveryError extends SyncError {}
 

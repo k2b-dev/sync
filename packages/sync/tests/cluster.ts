@@ -74,5 +74,38 @@ export const startNode = async (node: 1 | 2 | 3): Promise<void> => {
   await waitForPlacementReady();
 };
 
+/**
+ * A stopped node's R3 streams accept writes again only after a remaining node
+ * wins the stream's leader election, and new consumers need the meta leader.
+ * A publish during either election can time out, which Sync reports as an
+ * unknown outcome by design. Poll over the caller's own connection, so it has
+ * also reconnected, until the meta leader answers and every stream reports a
+ * leader other than the stopped node.
+ */
+export const waitForLeaders = async (
+  nc: NatsConnection,
+  streams: string[],
+  stoppedNode?: 1 | 2 | 3,
+  timeoutMs = 30_000,
+): Promise<void> => {
+  const { jetstreamManager } = await import("@nats-io/jetstream");
+  const stopped = stoppedNode === undefined ? undefined : `sync-test-nats-${stoppedNode}`;
+  const deadline = Date.now() + timeoutMs;
+  let last = "no answer yet";
+  while (Date.now() < deadline) {
+    try {
+      const jsm = await jetstreamManager(nc, { timeout: 2_000, checkAPI: false });
+      await jsm.getAccountInfo(); // in a cluster only the meta leader answers
+      const leaders = await Promise.all(streams.map(async (name) => (await jsm.streams.info(name)).cluster?.leader));
+      if (leaders.every((leader) => leader !== undefined && leader !== stopped)) return;
+      last = `stream leaders ${JSON.stringify(leaders)}`;
+    } catch (error) {
+      last = String(error);
+    }
+    await Bun.sleep(250);
+  }
+  throw new Error(`JetStream leaders were not elected within ${timeoutMs} ms: ${last}`);
+};
+
 export const uniqueName = (prefix: string): string =>
   `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
