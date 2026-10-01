@@ -37,7 +37,7 @@ const runs = sync.job<{ runId: string }>({ id: "workflow-runs" });
 await sync.ready(); // verifies the server, provisions resources, fails on drift
 ```
 
-`createSync()` and the primitive factories perform no I/O. `ready()` verifies the connection and server version, creates missing resources, and compares every existing resource against its declaration — an incompatible difference throws `ResourceDriftError` with a field diff and mutates nothing.
+`createSync()` and the primitive factories perform no I/O. `ready()` verifies the connection and server version, creates missing resources, and compares every existing resource against its declaration — an incompatible difference throws `ResourceDriftError` with a field diff and mutates nothing. When JetStream does not answer yet (for example while the cluster elects its meta leader), `ready()` rejects; call it again on the same instance to retry.
 
 Shutdown order:
 

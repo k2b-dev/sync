@@ -191,13 +191,22 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     );
   };
 
+  /**
+   * Concurrent callers share one build. A failed build (JetStream not
+   * answering yet) is not cached, so a later ready() tries again.
+   */
   const buildContext = (): Promise<ProvisionContext> => {
-    ctxPromise ??= (async () => {
+    if (ctxPromise) return ctxPromise;
+    const build = (async () => {
       const jsm = await jetstreamManager(nc);
       const js = jetstream(nc);
       return { jsm, js, kvm: new Kvm(js), objm: new Objm(js) };
     })();
-    return ctxPromise;
+    ctxPromise = build;
+    build.catch(() => {
+      if (ctxPromise === build) ctxPromise = null;
+    });
+    return build;
   };
 
   const provisionEntry = async (entry: DeclarationEntry, context: ProvisionContext): Promise<void> => {
