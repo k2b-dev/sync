@@ -26,6 +26,7 @@ await connection.drain();                              // then the caller's conn
 ```
 
 - One Sync instance per process; primitives are declared through it.
+- A rejected `ready()` (JetStream not answering yet at startup) can be retried on the same instance; a closed connection still needs a new connection and instance.
 - `namespace` isolates deployments; `application` is ownership metadata (default resource owner). A different application opening a shared resource must pass the same `owner` explicitly.
 - Redeclaring an existing resource with a different config throws `ResourceDriftError` (nothing is mutated). Same identity + different config in one process throws before I/O.
 
