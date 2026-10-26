@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { jetstreamManager } from "@nats-io/jetstream";
 import type { NatsConnection, Subscription } from "@nats-io/nats-core";
 import { createSync } from "../../src/sync.ts";
 import type { Sync } from "../../src/sync.ts";
 import { StaleDeliveryError } from "../../src/errors.ts";
 import { resourceIdentity, streamName } from "../../src/naming.ts";
 import { connectToCluster, startNode, stopNode, uniqueName, waitForLeaders } from "../cluster.ts";
-import { cleanupNamespaces, testNamespace, waitFor } from "../helpers.ts";
+import { cleanupNamespaces, namespaceStreams, testNamespace, waitFor } from "../helpers.ts";
 
 let nc: NatsConnection;
 let sync: Sync;
@@ -262,3 +263,34 @@ describe("node loss", () => {
   }, 90_000);
 });
 
+describe("startup before JetStream answers", () => {
+  test("a failed first ready() can be retried on the same instance once JetStream answers", async () => {
+    // Node 1 stays up, so the connection itself never drops.
+    const conn = await connectToCluster({ name: "late-jetstream", servers: ["nats://127.0.0.1:14222"] });
+    const localSync = createSync({ connection: conn, namespace, application: "tests" });
+    const queue = localSync.queue<{ n: number }>({ owner: "tests", id: "late-jetstream" });
+
+    await Promise.all([stopNode(2), stopNode(3)]);
+    try {
+      // Without a meta quorum JetStream API requests fail on node 1.
+      await waitFor(async () => {
+        const jsm = await jetstreamManager(conn, { timeout: 1_000, checkAPI: false });
+        return jsm.getAccountInfo().then(
+          () => false,
+          () => true,
+        );
+      }, 30_000);
+      await expect(localSync.ready()).rejects.toThrow();
+    } finally {
+      await Promise.all([startNode(2), startNode(3)]); // wait until R3 placement works again
+    }
+
+    // Streams that lost their quorum elect leaders again; later tests and cleanup need them.
+    await waitForLeaders(conn, await namespaceStreams(conn, [namespace]));
+    await localSync.ready();
+    await queue.send({ data: { n: 1 } });
+    expect(localSync.health().state).toBe("ready");
+    await localSync.drain({ timeoutMs: 2_000 });
+    await conn.close();
+  }, 120_000);
+});

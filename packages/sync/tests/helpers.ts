@@ -5,8 +5,8 @@ import { uniqueName } from "./cluster.ts";
 /** Unique per-test-run namespace so runs never collide on the persistent cluster. */
 export const testNamespace = (): string => uniqueName("t");
 
-/** Delete every Sync-managed stream (incl. KV_/OBJ_ backing streams) of the given namespaces. */
-export const cleanupNamespaces = async (nc: NatsConnection, namespaces: string[]): Promise<void> => {
+/** Every Sync-managed stream (incl. KV_/OBJ_ backing streams) of the given namespaces. */
+export const namespaceStreams = async (nc: NatsConnection, namespaces: string[]): Promise<string[]> => {
   const jsm = await jetstreamManager(nc);
   const wanted = new Set(namespaces);
   const names: string[] = [];
@@ -16,7 +16,13 @@ export const cleanupNamespaces = async (nc: NatsConnection, namespaces: string[]
       names.push(info.config.name);
     }
   }
-  for (const name of names) await jsm.streams.delete(name).catch(() => {});
+  return names;
+};
+
+/** Delete every Sync-managed stream of the given namespaces. */
+export const cleanupNamespaces = async (nc: NatsConnection, namespaces: string[]): Promise<void> => {
+  const jsm = await jetstreamManager(nc);
+  for (const name of await namespaceStreams(nc, namespaces)) await jsm.streams.delete(name).catch(() => {});
 };
 
 export const collect = async <T>(iterable: AsyncIterable<T>, limit?: number): Promise<T[]> => {
