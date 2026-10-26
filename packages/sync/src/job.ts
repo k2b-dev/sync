@@ -4,7 +4,7 @@ import { JetStreamApiError } from "@nats-io/jetstream";
 import { decodeEnvelope, decodeJson, encodeJson, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { BatchSubmitError, StoreFullError, SyncUsageError, asError } from "./errors.ts";
-import { isCasConflict, kvCasPut } from "./kv.ts";
+import { isCasConflict, kvCasPut, kvReadAuthoritative } from "./kv.ts";
 import { assertName, kvBucketName, resourceIdentity, streamName, subjectToken } from "./naming.ts";
 import { ensureKv, toStorageType } from "./resources.ts";
 import { createQueueCore } from "./queue.ts";
@@ -151,25 +151,8 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
   const loadClaim = async (tenantId: string, key: string) => {
     await getClaims();
     const ctx = await runtime.context();
-    try {
-      // KV direct reads can be served by a lagging follower. Admission must
-      // never acknowledge accepted work based on a stale missing generation.
-      const entry = await ctx.jsm.streams.getMessage(`KV_${claimsBucket}`, {
-        last_by_subj: `$KV.${claimsBucket}.${claimKey(tenantId, key)}`,
-      });
-      if (entry === null) return { claim: null, revision: 0 };
-      // Tombstones: explicit KV delete/purge operations AND server-written
-      // TTL expiry markers (Nats-Marker-Reason, no KV-Operation, empty body).
-      const tombstone = entry.header.get("KV-Operation") !== "" ||
-        entry.header.get("Nats-Marker-Reason") !== "" || entry.data.length === 0;
-      return {
-        claim: tombstone ? null : decodeJson<CoalescedClaim<Input> | LegacyClaim>(entry.data),
-        revision: entry.seq,
-      };
-    } catch (error) {
-      if (!(error instanceof JetStreamApiError) || error.code !== 10037) throw error;
-      return { claim: null, revision: 0 };
-    }
+    const { data, revision } = await kvReadAuthoritative(ctx, claimsBucket, claimKey(tenantId, key));
+    return { claim: data === null ? null : decodeJson<CoalescedClaim<Input> | LegacyClaim>(data), revision };
   };
 
   const putClaim = async (tenantId: string, key: string, claim: CoalescedClaim<Input>, revision: number) => {

@@ -1,7 +1,7 @@
 import type { KV } from "@nats-io/kv";
 import { decodeJson, encodeJson } from "./codec.ts";
-import { kvCasPut } from "./kv.ts";
-import { asError } from "./errors.ts";
+import { kvCasPut, kvReadAuthoritative } from "./kv.ts";
+import type { LockLostDetail, LockLostReason } from "./events.ts";
 import { assertName, assertSubjectLength, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
 import { ensureKv, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
@@ -120,14 +120,14 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
   const readKey = async (
     resource: string,
   ): Promise<{ record: LockRecord | null; lastRevision: number }> => {
-    const store = await getKv();
-    const entry = await store.get(keyOf(resource));
-    if (entry === null) return { record: null, lastRevision: 0 };
-    if (entry.operation !== "PUT") return { record: null, lastRevision: entry.revision };
+    await getKv();
+    const ctx = await runtime.context();
+    const { data, revision } = await kvReadAuthoritative(ctx, bucket, keyOf(resource));
+    if (data === null) return { record: null, lastRevision: revision };
     try {
-      return { record: decodeJson<LockRecord>(entry.value), lastRevision: entry.revision };
+      return { record: decodeJson<LockRecord>(data), lastRevision: revision };
     } catch {
-      return { record: null, lastRevision: entry.revision };
+      return { record: null, lastRevision: revision };
     }
   };
 
@@ -174,20 +174,34 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
     // Existing work may finish during graceful drain; stopped workers must not renew leases.
     if (runtime.health().state === "stopped") return false;
     const ttlMs = options.ttlMs ?? defaultTtlMs;
-    const current = await readKey(lock.resource);
-    if (current.record === null || current.record.ownerToken !== lock.ownerToken) {
-      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { lock: lock.resource } });
-      return false;
+    let attemptedRevision: number | null = null;
+    // One initial CAS plus at most two retries, each based on a fresh leader read.
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      const current = await readKey(lock.resource);
+      const reason: LockLostReason | null = current.record === null ? "missing"
+        : current.record.ownerToken !== lock.ownerToken ? "owner_changed"
+        : !(Date.parse(current.record.expiresAt) > Date.now()) ? "expired"
+        : attempt === 3 ? "revision_conflict" : null;
+      if (reason !== null) {
+        const detail: LockLostDetail = {
+          lock: lock.resource,
+          reason,
+          acquisitionRevision: lock.fence.toString(),
+          attemptedRevision,
+          observedRevision: current.lastRevision,
+        };
+        runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail });
+        return false;
+      }
+      const expiresAt = new Date(Date.now() + ttlSeconds(ttlMs) * 1_000);
+      const record: LockRecord = { ownerToken: lock.ownerToken, expiresAt: expiresAt.toISOString() };
+      attemptedRevision = current.lastRevision;
+      const seq = await casPutWithTtl(keyOf(lock.resource), record, current.lastRevision, ttlMs);
+      if (seq === null) continue;
+      lock.expiresAt = expiresAt;
+      return true;
     }
-    const expiresAt = new Date(Date.now() + ttlSeconds(ttlMs) * 1_000);
-    const record: LockRecord = { ...current.record, expiresAt: expiresAt.toISOString() };
-    const seq = await casPutWithTtl(keyOf(lock.resource), record, current.lastRevision, ttlMs);
-    if (seq === null) {
-      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { lock: lock.resource } });
-      return false;
-    }
-    lock.expiresAt = expiresAt;
-    return true;
+    return false;
   };
 
   const release: Mutex["release"] = async (lock) => {

@@ -4,6 +4,19 @@ import type { JsonValue } from "./codec.ts";
 // Structured events
 // ==========================
 
+export type LockLostReason = "missing" | "owner_changed" | "expired" | "revision_conflict";
+
+export type LockLostDetail = {
+  lock: string;
+  reason: LockLostReason;
+  /** Acquisition fence, serialized as a decimal bigint string. */
+  acquisitionRevision: string;
+  /** Last rejected CAS revision, or null if no CAS was attempted. */
+  attemptedRevision: number | null;
+  /** Revision from the final authoritative read; zero means no message. */
+  observedRevision: number;
+};
+
 /**
  * Bounded structured events for consumers building operational tooling.
  * Events are observations only: an observer can never alter transport state,
@@ -35,8 +48,15 @@ export type SyncEvent = {
   /** Sync resource id (not the NATS name) when the event concerns a resource. */
   resource?: string;
   kind?: string;
+  /** For lock_lost events, see LockLostDetail and LockLostEvent. */
   detail?: Record<string, JsonValue>;
   error?: string;
+};
+
+/** Typed mutex loss event; the general SyncEvent shape stays source-compatible. */
+export type LockLostEvent = Omit<SyncEvent, "type" | "detail"> & {
+  type: "lock_lost";
+  detail: LockLostDetail;
 };
 
 export type SyncObserver = (event: SyncEvent) => void | Promise<void>;
