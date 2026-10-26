@@ -285,10 +285,16 @@ const m = sync.mutex({ id, owner?, ttlMs? /* default 10_000, rounds up to second
 
 const lock = await m.acquire({ resource, ttlMs?, signal? }); // Lock | null
 // Lock: { resource, ownerToken, fence: bigint /* monotonic, stable across extends */, expiresAt }
-await m.extend(lock, { ttlMs? });   // boolean; false = lease lost
+await m.extend(lock, { ttlMs? });   // boolean; false = lease could not be renewed
 await m.release(lock);              // boolean; owner-only
 await m.withLock({ resource, ttlMs?, signal? }, async (lock) => value); // value | null; always releases
 ```
+
+All ownership decisions use authoritative stream reads, bypassing follower-served
+KV direct reads. On a CAS revision conflict, `extend` rereads and retries at most
+twice after the first attempt, only for the same unexpired owner. The acquisition
+fence remains unchanged. A `revision_conflict` failure can still belong to the
+same owner; `false` does not prove a replacement acquired it.
 
 A lease cannot stop an expired owner writing to external systems afterwards — persist and compare `fence`, or make effects idempotent.
 
@@ -372,6 +378,17 @@ administrative endpoints and audit mutations themselves.
 ## Events
 
 `observe` / `sync.events()` deliver `SyncEvent { type, at, resource?, kind?, detail?, error? }`. Types: `connection`, `ready`, `resource_verified`, `resource_drifted`, `worker_started`, `worker_stopped`, `handler_started` / `handler_settled` (queue/job/topic/scheduler runs: `{ id, key?, attempt, status: success|retry|dead_letter, durationMs }`), `handler_error`, `redelivery`, `dead_letter`, `lock_lost`, `schedule_tick`, `schedule_misfire`, `pump_recovered`, `pump_run_started` / `pump_run_settled`, `object_error`, `watch_resync_required`, `drain_timeout`. Events carry ids, keys, and statuses — never handler results or payloads. Observers cannot block or alter transport work; slow `events()` readers drop events.
+
+`lock_lost` from an unsuccessful extension has `LockLostDetail` (also exported
+as the typed `LockLostEvent`): `{ lock, reason, acquisitionRevision,
+attemptedRevision, observedRevision }`. `reason` is `missing` (including
+KV delete/purge and TTL markers), `owner_changed`, `expired`, or
+`revision_conflict` (three rejected writes; the final read still shows the same
+unexpired owner). `acquisitionRevision` is the decimal acquisition fence;
+`attemptedRevision` is the last rejected CAS revision, or `null` before any
+write; `observedRevision` is the final authoritative revision, or `0` when no
+message exists. Diagnostics contain no owner tokens or stored values. A stopped
+runtime returns `false` without renewing or emitting a loss event.
 
 ## Errors
 

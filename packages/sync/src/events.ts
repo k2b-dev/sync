@@ -4,11 +4,6 @@ import type { JsonValue } from "./codec.ts";
 // Structured events
 // ==========================
 
-/**
- * Bounded structured events for consumers building operational tooling.
- * Events are observations only: an observer can never alter transport state,
- * and a slow observer causes events to be dropped, never work to block.
- */
 export type LockLostReason = "missing" | "owner_changed" | "expired" | "revision_conflict";
 
 export type LockLostDetail = {
@@ -22,6 +17,11 @@ export type LockLostDetail = {
   observedRevision: number;
 };
 
+/**
+ * Bounded structured events for consumers building operational tooling.
+ * Events are observations only: an observer can never alter transport state,
+ * and a slow observer causes events to be dropped, never work to block.
+ */
 export type SyncEvent = {
   type:
     | "connection" // status: connected | reconnecting | closed
