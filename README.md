@@ -250,6 +250,28 @@ const result = await locks.withLock({ resource: "tenant:42" }, async (lock) => {
 });
 ```
 
+`acquire()`, `extend()` and `release()` decide ownership from authoritative
+stream reads, bypassing follower-served KV direct reads. `extend()` retries a
+CAS conflict at most twice after the first attempt, rereading the current
+record each time. It only renews the same owner while the stored lease is
+unexpired and preserves the original acquisition fence. `false` means the
+lease could not be renewed; even exhausted revision contention does not prove
+that another owner acquired it.
+
+An unsuccessful `extend()` emits `lock_lost` with typed `detail`:
+
+- `lock`: resource key;
+- `reason`: `missing` (no live record, including delete/purge/TTL markers),
+  `owner_changed`, `expired`, or `revision_conflict` (three rejected CAS writes
+  while the final read still shows the same unexpired owner);
+- `acquisitionRevision`: acquisition fence as a decimal string;
+- `attemptedRevision`: last rejected CAS revision, or `null` if no CAS ran;
+- `observedRevision`: final authoritative revision (`0` for no message).
+
+Loss diagnostics contain no owner tokens or stored values. A stopped runtime
+returns `false` without renewing or emitting a loss event. These read, retry,
+and diagnostic corrections ship in **7.0.1**; no resource migration is needed.
+
 A lease alone cannot stop an expired owner from writing to PostgreSQL afterwards. Consumers needing strict exclusion compare the `fence` or make effects idempotent.
 
 ## Ephemeral

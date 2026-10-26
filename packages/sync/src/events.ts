@@ -9,35 +9,54 @@ import type { JsonValue } from "./codec.ts";
  * Events are observations only: an observer can never alter transport state,
  * and a slow observer causes events to be dropped, never work to block.
  */
+export type LockLostReason = "missing" | "owner_changed" | "expired" | "revision_conflict";
+
+export type LockLostDetail = {
+  lock: string;
+  reason: LockLostReason;
+  /** Acquisition fence, serialized as a decimal bigint string. */
+  acquisitionRevision: string;
+  /** Last rejected CAS revision, or null if no CAS was attempted. */
+  attemptedRevision: number | null;
+  /** Revision from the final authoritative read; zero means no message. */
+  observedRevision: number;
+};
+
 export type SyncEvent = {
-  type:
-    | "connection" // status: connected | reconnecting | closed
-    | "ready"
-    | "resource_verified"
-    | "resource_drifted"
-    | "worker_started"
-    | "worker_stopped"
-    | "handler_started"
-    | "handler_settled"
-    | "handler_error"
-    | "redelivery"
-    | "dead_letter"
-    | "lock_lost"
-    | "schedule_tick"
-    | "schedule_misfire"
-    | "pump_recovered"
-    | "pump_run_started" // detail: key
-    | "pump_run_settled" // detail: key, status, dispatched, failureCount, durationMs, error?
-    | "object_error"
-    | "watch_resync_required"
-    | "drain_timeout";
   at: Date;
   /** Sync resource id (not the NATS name) when the event concerns a resource. */
   resource?: string;
   kind?: string;
-  detail?: Record<string, JsonValue>;
   error?: string;
-};
+} & (
+  | { type: "lock_lost"; detail: LockLostDetail }
+  | {
+      type:
+        | "connection" // status: connected | reconnecting | closed
+        | "ready"
+        | "resource_verified"
+        | "resource_drifted"
+        | "worker_started"
+        | "worker_stopped"
+        | "handler_started"
+        | "handler_settled"
+        | "handler_error"
+        | "redelivery"
+        | "dead_letter"
+        | "schedule_tick"
+        | "schedule_misfire"
+        | "pump_recovered"
+        | "pump_run_started" // detail: key
+        | "pump_run_settled" // detail: key, status, dispatched, failureCount, durationMs, error?
+        | "object_error"
+        | "watch_resync_required"
+        | "drain_timeout";
+      detail?: Record<string, JsonValue>;
+    }
+);
+
+type WithoutTimestamp<E> = E extends unknown ? Omit<E, "at"> : never;
+type EventInput = WithoutTimestamp<SyncEvent>;
 
 export type SyncObserver = (event: SyncEvent) => void | Promise<void>;
 
@@ -54,7 +73,7 @@ type EventSubscriber = {
 // ==========================
 
 export type EventHub = {
-  emit(event: Omit<SyncEvent, "at">): void;
+  emit(event: EventInput): void;
   subscribe(options?: { signal?: AbortSignal }): AsyncIterable<SyncEvent>;
   readonly dropped: number;
 };
@@ -63,7 +82,7 @@ export const createEventHub = (observe?: SyncObserver): EventHub => {
   const subscribers = new Set<EventSubscriber>();
   let dropped = 0;
 
-  const emit = (partial: Omit<SyncEvent, "at">): void => {
+  const emit = (partial: EventInput): void => {
     const event: SyncEvent = { ...partial, at: new Date() };
     if (observe) {
       try {

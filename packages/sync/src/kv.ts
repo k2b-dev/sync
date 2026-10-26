@@ -61,3 +61,25 @@ export const kvCasPut = async (
     throw error;
   }
 };
+
+/** Leader-backed read for ownership/admission decisions; retain tombstone revisions for CAS. */
+export const kvReadAuthoritative = async (
+  ctx: ProvisionContext,
+  bucket: string,
+  key: string,
+): Promise<{ data: Uint8Array | null; revision: number }> => {
+  try {
+    // KV direct reads can be served by a lagging follower.
+    const entry = await ctx.jsm.streams.getMessage(`KV_${bucket}`, {
+      last_by_subj: `$KV.${bucket}.${key}`,
+    });
+    if (entry === null) return { data: null, revision: 0 };
+    // Explicit delete/purge and server-written TTL expiry markers.
+    const tombstone = entry.header.get("KV-Operation") !== "" ||
+      entry.header.get("Nats-Marker-Reason") !== "" || entry.data.length === 0;
+    return { data: tombstone ? null : entry.data, revision: entry.seq };
+  } catch (error) {
+    if (!(error instanceof JetStreamApiError) || error.code !== 10037) throw error;
+    return { data: null, revision: 0 };
+  }
+};
