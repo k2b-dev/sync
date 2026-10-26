@@ -11,7 +11,7 @@ export type {
   SyncResourceSummary,
 } from "./src/runtime.ts";
 
-export type { SyncEvent, SyncObserver, LockLostReason, LockLostDetail } from "./src/events.ts";
+export type { SyncEvent, SyncObserver, LockLostReason, LockLostDetail, LockLostEvent } from "./src/events.ts";
 export type { JsonValue } from "./src/codec.ts";
 export type {
   DeliveryConfig,

@@ -258,7 +258,8 @@ unexpired and preserves the original acquisition fence. `false` means the
 lease could not be renewed; even exhausted revision contention does not prove
 that another owner acquired it.
 
-An unsuccessful `extend()` emits `lock_lost` with typed `detail`:
+An unsuccessful `extend()` emits `lock_lost` (type `LockLostEvent`) with
+`LockLostDetail`:
 
 - `lock`: resource key;
 - `reason`: `missing` (no live record, including delete/purge/TTL markers),

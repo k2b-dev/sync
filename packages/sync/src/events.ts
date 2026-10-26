@@ -23,40 +23,41 @@ export type LockLostDetail = {
 };
 
 export type SyncEvent = {
+  type:
+    | "connection" // status: connected | reconnecting | closed
+    | "ready"
+    | "resource_verified"
+    | "resource_drifted"
+    | "worker_started"
+    | "worker_stopped"
+    | "handler_started"
+    | "handler_settled"
+    | "handler_error"
+    | "redelivery"
+    | "dead_letter"
+    | "lock_lost"
+    | "schedule_tick"
+    | "schedule_misfire"
+    | "pump_recovered"
+    | "pump_run_started" // detail: key
+    | "pump_run_settled" // detail: key, status, dispatched, failureCount, durationMs, error?
+    | "object_error"
+    | "watch_resync_required"
+    | "drain_timeout";
   at: Date;
   /** Sync resource id (not the NATS name) when the event concerns a resource. */
   resource?: string;
   kind?: string;
+  /** For lock_lost events, see LockLostDetail and LockLostEvent. */
+  detail?: Record<string, JsonValue>;
   error?: string;
-} & (
-  | { type: "lock_lost"; detail: LockLostDetail }
-  | {
-      type:
-        | "connection" // status: connected | reconnecting | closed
-        | "ready"
-        | "resource_verified"
-        | "resource_drifted"
-        | "worker_started"
-        | "worker_stopped"
-        | "handler_started"
-        | "handler_settled"
-        | "handler_error"
-        | "redelivery"
-        | "dead_letter"
-        | "schedule_tick"
-        | "schedule_misfire"
-        | "pump_recovered"
-        | "pump_run_started" // detail: key
-        | "pump_run_settled" // detail: key, status, dispatched, failureCount, durationMs, error?
-        | "object_error"
-        | "watch_resync_required"
-        | "drain_timeout";
-      detail?: Record<string, JsonValue>;
-    }
-);
+};
 
-type WithoutTimestamp<E> = E extends unknown ? Omit<E, "at"> : never;
-type EventInput = WithoutTimestamp<SyncEvent>;
+/** Typed mutex loss event; the general SyncEvent shape stays source-compatible. */
+export type LockLostEvent = Omit<SyncEvent, "type" | "detail"> & {
+  type: "lock_lost";
+  detail: LockLostDetail;
+};
 
 export type SyncObserver = (event: SyncEvent) => void | Promise<void>;
 
@@ -73,7 +74,7 @@ type EventSubscriber = {
 // ==========================
 
 export type EventHub = {
-  emit(event: EventInput): void;
+  emit(event: Omit<SyncEvent, "at">): void;
   subscribe(options?: { signal?: AbortSignal }): AsyncIterable<SyncEvent>;
   readonly dropped: number;
 };
@@ -82,7 +83,7 @@ export const createEventHub = (observe?: SyncObserver): EventHub => {
   const subscribers = new Set<EventSubscriber>();
   let dropped = 0;
 
-  const emit = (partial: EventInput): void => {
+  const emit = (partial: Omit<SyncEvent, "at">): void => {
     const event: SyncEvent = { ...partial, at: new Date() };
     if (observe) {
       try {
