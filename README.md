@@ -185,6 +185,56 @@ Gap detection on a shared topic: a limits stream only loses its front (age, byte
 
 `deadLetterRetention: { maxAgeMs?, maxBytes? }` sizes the consumer dead-letter stream independently; both default to `retention`. Its `maxBytes` must hold one dead letter (payload limit plus 4 KiB).
 
+### Retain updates until snapshots cover them
+
+For a document log that must keep every accepted update, opt into rejection
+and omit the topic's age limit:
+
+```ts
+const documents = sync.topic<DocumentUpdate>({
+  id: "document-updates",
+  whenFull: "reject",
+  retention: { maxBytes: 1024 ** 3 }, // no maxAgeMs: no age expiry
+  deadLetterRetention: { maxAgeMs: 7 * 24 * 3_600_000, maxBytes: 1024 ** 2 },
+});
+```
+
+At `maxBytes` or `maxMessages`, JetStream rejects new events without evicting
+accepted ones. `publish()` and `publishBatch()` throw `StoreFullError` when
+capacity refusal is confirmed. Back off and retry after snapshots free room;
+keep unaccepted input available to the writer. Transport timeouts have an
+unknown outcome and remain transport errors; they are not safe rejections.
+
+Persist snapshots in your application's durable store, then compute the
+minimum covered stream sequence across **all documents in this topic** and
+call `await documents.prune({ through: documents.cursorAt(minimumSequence) })`.
+The watermark is inclusive. A missing snapshot contributes sequence zero;
+never omit a stalled document. Advance idle documents' persisted cursors only
+after proving that they have no uncovered events up to the new cursor.
+Serialize watermark computation with snapshot creation, restoration and
+document lifecycle changes so coverage cannot regress underneath pruning.
+
+`prune()` returns `{ purged }`, removes only the stream prefix at or below
+`through`, and preserves concurrent appends above it. It rejects foreign
+cursors and watermarks beyond the current head. Retrying after a crash is
+safe, including when the snapshot committed but pruning did not. Readers
+behind the pruned prefix must load a covering snapshot before replaying.
+There is no per-tenant purge: holes in the middle of a shared stream would
+break the retained-window gap detection. One stalled snapshot can fill the
+stream and block new writes; monitor the backlog and repair that snapshot.
+
+Sync owns retention and bounded deletion. The application owns snapshot
+durability and the safe watermark; Sync cannot verify an external SQL commit.
+Acknowledging a topic consumer alone neither creates a snapshot nor prunes
+events. Keep snapshot work independent of new writes so a full log can recover.
+
+The existing `whenFull: "discard_oldest"` default and explicitly configured
+ages are unchanged. An omitted topic `maxAgeMs` also leaves its DLQ without
+age expiry unless `deadLetterRetention.maxAgeMs` is set. Changing an existing
+stream's discard mode or age fails with `ResourceDriftError`; Sync never
+changes retention in place. Migrate only after persisting coverage of its
+accepted events. Other primitives keep their existing age requirements.
+
 Topic DLQ entries can be inspected and deleted through `deadLetters`; opt-in recovery targets only the original consumer.
 
 ## Pump

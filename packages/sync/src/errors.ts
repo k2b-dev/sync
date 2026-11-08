@@ -68,7 +68,7 @@ export class ObjectTooLargeError extends SyncError {
 }
 
 /**
- * A queue or job declared with `whenFull: "reject"` reached its retention
+ * A queue, job, or topic declared with `whenFull: "reject"` reached its retention
  * limit (`maxBytes` or `maxMessages`) and refused new work. Nothing was
  * accepted; retry later or shed the work.
  */
