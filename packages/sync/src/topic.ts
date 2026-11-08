@@ -1,5 +1,6 @@
 import { AckPolicy, DeliverPolicy, DiscardPolicy, JetStreamApiError, RetentionPolicy } from "@nats-io/jetstream";
 import type { Consumer, JsMsg } from "@nats-io/jetstream";
+import { headers as natsHeaders } from "@nats-io/nats-core";
 import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
@@ -486,9 +487,10 @@ export const createTopic = <T>(
     return { purged: result.purged };
   };
 
-  const storeFull = (cause: unknown, limit?: "maxBytes" | "maxMessages"): StoreFullError | null => {
+  const storeFull = (cause: unknown): StoreFullError | null => {
     if (whenFull !== "reject") return null;
-    if (limit === undefined && cause instanceof JetStreamApiError && cause.code === 10077) {
+    let limit: "maxBytes" | "maxMessages" | undefined;
+    if (cause instanceof JetStreamApiError && cause.code === 10077) {
       if (/maximum bytes exceeded/i.test(cause.message)) limit = "maxBytes";
       if (/maximum messages exceeded/i.test(cause.message)) limit = "maxMessages";
     }
@@ -901,35 +903,25 @@ export const createTopic = <T>(
       // persists all events or none.
       const batch = await ctx.js.startBatch(subject, encoded[0]!, expect !== undefined ? { expect } : {});
       for (const bytes of encoded.slice(1, -1)) batch.add(subject, bytes);
-      const ack = await batch.commit(subject, encoded[encoded.length - 1]!);
-      return { lastSequence: ack.seq, count: ack.count, cursor: cursorOf(identity, ack.seq), eventIds };
+      // NATS.js 3.4's batch.commit() drops server errors before parsing them.
+      // Commit the same public batch protocol through publish(), which keeps
+      // the actual refusal (including byte overhead) and unknown outcomes.
+      const headers = natsHeaders();
+      headers.set("Nats-Batch-Id", batch.id);
+      headers.set("Nats-Batch-Sequence", String(batch.count + 1));
+      headers.set("Nats-Batch-Commit", "1");
+      const ack = await ctx.js.publish(subject, encoded[encoded.length - 1]!, { headers });
+      return { lastSequence: ack.seq, count: encoded.length, cursor: cursorOf(identity, ack.seq), eventIds };
     } catch (error) {
       const full = storeFull(error);
       if (full !== null) throw full;
       if (/atomic publish is disabled/i.test(asError(error).message)) {
         throw new SyncUsageError(`topic ${config.id}: the stream predates atomic batches (allow_atomic off); recreate it`);
       }
-      // The batch commit error is generic in NATS.js 3.4 — disambiguate a
-      // lost OCC race from real faults by re-reading the subject head.
-      const refusedBatch = asError(error).message === "batch didn't contain number of published messages";
-      if (expect !== undefined && (refusedBatch || /wrong last sequence/i.test(asError(error).message))) {
-        const head = await ctx.jsm.streams.getMessage(stream, { last_by_subj: subject }).catch(() => null);
-        const headSeq = head === null ? 0 : head.seq;
-        if (headSeq !== expect.lastSubjectSequence) {
-          throw new ConflictError(
-            `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
-          );
-        }
-      }
-      // NATS.js 3.4 loses the server's reason for a refused batch commit.
-      // Only classify an explicit refusal, never a timeout/unknown outcome.
-      if (whenFull === "reject" && refusedBatch) {
-        const info = await ctx.jsm.streams.info(stream).catch(() => null);
-        const batchBytes = encoded.reduce((sum, bytes) => sum + bytes.byteLength, 0);
-        if (info !== null && info.state.bytes + batchBytes > info.config.max_bytes) throw storeFull(error, "maxBytes");
-        if (info !== null && info.config.max_msgs > 0 && info.state.messages + encoded.length > info.config.max_msgs) {
-          throw storeFull(error, "maxMessages");
-        }
+      if (expect !== undefined && /wrong last sequence/i.test(asError(error).message)) {
+        throw new ConflictError(
+          `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
+        );
       }
       throw error;
     }

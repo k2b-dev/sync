@@ -81,6 +81,14 @@ test("omitted age retains uncovered events while an explicit age still expires",
   expect((await collect(retained.replay())).map(e => e.data)).toEqual(["uncovered"]);
 }, 30_000);
 
+test("batch backpressure includes stored subject and header bytes, without guessing from payload size", async () => {
+  const topic = sync.topic<string>({ ...config({ maxBytes: 4_096 }), maxPayloadBytes: 4_096 });
+  await topic.publish({ data: "a".repeat(3_000) });
+  // Payloads alone fit the remaining bytes, but broker message overhead does not.
+  await expect(topic.publishBatch({ events: [{ data: "b".repeat(200) }, { data: "c".repeat(200) }] })).rejects.toBeInstanceOf(StoreFullError);
+  expect((await collect(topic.replay())).map(e => e.data)).toEqual(["a".repeat(3_000)]);
+}, 30_000);
+
 test("pruning is inclusive, stream-wide, idempotent and never passes the persisted watermark", async () => {
   const topic = sync.topic<number>(config({ maxMessages: 4 }));
   const a = await topic.publish({ data: 1, tenantId: "a" });
