@@ -136,13 +136,21 @@ When upgrading a 6.2.0 deployment to the corrected coalescing implementation, st
 ## topic
 
 ```ts
-const t = sync.topic<T>({ id, owner?, retention /* required */, deadLetterRetention? /* { maxAgeMs?, maxBytes? }, defaults to retention */, dedupeWindowMs?, maxPayloadBytes?, replicas? });
+const t = sync.topic<T>({ id, owner?, retention /* { maxBytes, maxMessages?, maxAgeMs? }; omit age = no expiry */, whenFull? /* "discard_oldest" (default) | "reject" */, deadLetterRetention? /* { maxAgeMs?, maxBytes? }, defaults to retention */, dedupeWindowMs?, maxPayloadBytes?, replicas? });
 
 const r = await t.publish({ data, tenantId?, idempotencyKey?, orderingKey?, meta? });
 // → PublishReceipt & { eventId, cursor }
 
 await t.latestCursor({ tenantId? });        // TopicCursor | null, per tenant
 await t.head();                             // newest event of ANY tenant (one lookup); cursorAt(0) when empty
+await t.prune({ through: persistedWatermark }); // { purged }; inclusive prefix, ALL tenants
+// Commit covering snapshots first. through must be the minimum covered cursor
+// across ALL documents, including stalled/idle ones (missing snapshot = zero).
+// Sync cannot verify SQL commits. Serialize coverage against restores/lifecycle
+// changes; never prune a per-document cursor on a shared topic. Retry is safe.
+// Foreign cursor -> CursorMismatchError; beyond head -> SyncUsageError.
+// With whenFull: "reject", publish/publishBatch capacity refusals throw StoreFullError.
+// Omit maxAgeMs too to retain until explicit pruning; timeouts stay unknown outcomes.
 
 for await (const e of t.live({ tenantId?, signal? })) {}    // broadcast, no cursor/replay
 for await (const e of t.replay({ tenantId?, after?, until?, signal? })) {} // to head-at-start

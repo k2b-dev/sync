@@ -10,7 +10,7 @@
   },
   "scripts": {
     "test": "bun test --preload ./tests/preload.ts tests/*.test.ts",
-    "test:serial": "bun test --preload ./tests/preload.ts tests/serial/fault.test.ts && bun test --preload ./tests/preload.ts tests/serial/probe.test.ts",
+    "test:serial": "bun test --preload ./tests/preload.ts tests/serial/fault.test.ts && bun test --preload ./tests/preload.ts tests/serial/probe.test.ts && bun test --preload ./tests/preload.ts tests/serial/topic-retention.test.ts",
     "test:all": "bun run test && bun run test:serial",
     "typecheck": "bunx tsc --noEmit"
   },

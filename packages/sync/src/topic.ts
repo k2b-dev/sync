@@ -1,9 +1,10 @@
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, JetStreamApiError, RetentionPolicy } from "@nats-io/jetstream";
 import type { Consumer, JsMsg } from "@nats-io/jetstream";
+import { headers as natsHeaders } from "@nats-io/nats-core";
 import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
-import { ConflictError, CursorMismatchError, NotFoundError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
+import { ConflictError, CursorMismatchError, NotFoundError, RetentionGapError, StoreFullError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
 import { ensureConsumer, ensureStream, setConsumerPause, toStorageType } from "./resources.ts";
@@ -31,7 +32,10 @@ import type { ProcessOptions, Worker } from "./worker.ts";
 export type TopicConfig = {
   id: string;
   owner?: string;
-  retention: RetentionConfig;
+  /** Omit maxAgeMs to disable age expiry; maxBytes remains required. */
+  retention: Omit<RetentionConfig, "maxAgeMs"> & { maxAgeMs?: number };
+  /** Default discard_oldest evicts old events; reject preserves them and throws StoreFullError. */
+  whenFull?: "discard_oldest" | "reject";
   /**
    * Limits of the consumer dead-letter stream. Each field defaults to the
    * matching `retention` value. JetStream reserves `maxBytes` per stream, so a
@@ -194,6 +198,13 @@ export type Topic<T> = {
   latestCursor(options?: { tenantId?: string }): Promise<TopicCursor | null>;
   /** Cursor of the newest assigned sequence across ALL tenants (one stream lookup); cursorAt(0) when empty. */
   head(): Promise<TopicCursor>;
+  /**
+   * Delete events of ALL tenants through this inclusive persisted watermark.
+   * The caller must commit covering snapshots first and pass their minimum
+   * cursor (including idle tenants); Sync cannot verify external persistence.
+   * Idempotent: retry after a crash. Never removes events above through.
+   */
+  prune(input: { through: TopicCursor }): Promise<{ purged: number }>;
   live(options?: { tenantId?: string; signal?: AbortSignal }): AsyncIterable<TopicLiveEvent<T>>;
   replay(options?: {
     tenantId?: string;
@@ -267,13 +278,26 @@ export const createTopic = <T>(
 ): Topic<T> => {
   const identity = resourceIdentity(runtime.namespace, "topic", config.id);
   const owner = config.owner ?? runtime.application;
-  const retention = assertRetention(config.retention);
+  const retention = {
+    // Reuse the positive-limit validation; only omission maps to NATS's zero
+    // (unlimited age). Explicit zero remains an invalid age, as elsewhere.
+    ...assertRetention({ ...config.retention, maxAgeMs: config.retention.maxAgeMs ?? 1 }),
+    maxAgeMs: config.retention.maxAgeMs ?? 0,
+  };
+  const whenFull = config.whenFull ?? "discard_oldest";
+  if (whenFull !== "discard_oldest" && whenFull !== "reject") {
+    throw new RangeError('whenFull must be "discard_oldest" or "reject"');
+  }
   const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
   const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
-  const deadLetterRetention = assertRetention({
-    maxAgeMs: config.deadLetterRetention?.maxAgeMs ?? retention.maxAgeMs,
-    maxBytes: config.deadLetterRetention?.maxBytes ?? retention.maxBytes,
-  });
+  const deadLetterMaxAgeMs = config.deadLetterRetention?.maxAgeMs ?? config.retention.maxAgeMs;
+  const deadLetterRetention = {
+    ...assertRetention({
+      maxAgeMs: deadLetterMaxAgeMs ?? 1,
+      maxBytes: config.deadLetterRetention?.maxBytes ?? retention.maxBytes,
+    }),
+    maxAgeMs: deadLetterMaxAgeMs ?? 0,
+  };
   if (config.deadLetterRetention?.maxBytes !== undefined && deadLetterRetention.maxBytes < maxPayloadBytes + DLQ_HEADROOM_BYTES) {
     throw new RangeError(
       `deadLetterRetention.maxBytes must hold at least one dead letter (${maxPayloadBytes + DLQ_HEADROOM_BYTES} bytes)`,
@@ -296,7 +320,7 @@ export const createTopic = <T>(
   const declaration = runtime.declare({
     identity,
     owner,
-    configKey: JSON.stringify(["topic", config.id, owner, retention, deadLetterRetention, dedupeWindowMs, maxPayloadBytes, replicas]),
+    configKey: JSON.stringify(["topic", config.id, owner, retention, whenFull, deadLetterRetention, dedupeWindowMs, maxPayloadBytes, replicas]),
     natsNames: [stream, dlqStream],
     maxMessageBytes: maxPayloadBytes + DLQ_HEADROOM_BYTES,
     provision: async (ctx: ProvisionContext) => {
@@ -304,7 +328,7 @@ export const createTopic = <T>(
         name: stream,
         subjects: [`${root}.t.*.event`],
         retention: RetentionPolicy.Limits,
-        discard: DiscardPolicy.Old,
+        discard: whenFull === "reject" ? DiscardPolicy.New : DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
         max_age: nanos(retention.maxAgeMs),
@@ -414,6 +438,8 @@ export const createTopic = <T>(
         ...(expectation !== null ? { expect: { lastSubjectSequence: expectation.last_subject_sequence } } : {}),
       });
     } catch (error) {
+      const full = storeFull(error);
+      if (full !== null) throw full;
       if (expectation !== null && /wrong last sequence/i.test(asError(error).message)) {
         throw new ConflictError(
           `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
@@ -444,6 +470,34 @@ export const createTopic = <T>(
     await ensureReady();
     const ctx = await runtime.context();
     return cursorOf(identity, (await ctx.jsm.streams.info(stream)).state.last_seq);
+  };
+
+  const prune: Topic<T>["prune"] = async ({ through }) => {
+    runtime.assertActive();
+    const sequence = parseCursor(identity, through, "through");
+    if (!Number.isSafeInteger(sequence + 1)) throw new RangeError("through must leave room for an exclusive sequence");
+    await ensureReady();
+    const ctx = await runtime.context();
+    const state = (await ctx.jsm.streams.info(stream)).state;
+    if (sequence > state.last_seq) throw new SyncUsageError(`topic ${config.id}: through is beyond the stream head`);
+    if (sequence === 0) return { purged: 0 };
+    // NATS seq is exclusive. Never use an unbounded purge, even at the head:
+    // another producer can append between the head read and this request.
+    const result = await ctx.jsm.streams.purge(stream, { seq: sequence + 1 });
+    return { purged: result.purged };
+  };
+
+  const storeFull = (cause: unknown): StoreFullError | null => {
+    if (whenFull !== "reject") return null;
+    let limit: "maxBytes" | "maxMessages" | undefined;
+    if (cause instanceof JetStreamApiError && cause.code === 10077) {
+      if (/maximum bytes exceeded/i.test(cause.message)) limit = "maxBytes";
+      if (/maximum messages exceeded/i.test(cause.message)) limit = "maxMessages";
+    }
+    if (limit === undefined) return null;
+    const error = new StoreFullError(`topic ${config.id} is full (retention.${limit} reached); the events were not accepted`);
+    error.cause = cause;
+    return error;
   };
 
   const live: Topic<T>["live"] = (options = {}) => {
@@ -849,22 +903,25 @@ export const createTopic = <T>(
       // persists all events or none.
       const batch = await ctx.js.startBatch(subject, encoded[0]!, expect !== undefined ? { expect } : {});
       for (const bytes of encoded.slice(1, -1)) batch.add(subject, bytes);
-      const ack = await batch.commit(subject, encoded[encoded.length - 1]!);
-      return { lastSequence: ack.seq, count: ack.count, cursor: cursorOf(identity, ack.seq), eventIds };
+      // NATS.js 3.4's batch.commit() drops server errors before parsing them.
+      // Commit the same public batch protocol through publish(), which keeps
+      // the actual refusal (including byte overhead) and unknown outcomes.
+      const headers = natsHeaders();
+      headers.set("Nats-Batch-Id", batch.id);
+      headers.set("Nats-Batch-Sequence", String(batch.count + 1));
+      headers.set("Nats-Batch-Commit", "1");
+      const ack = await ctx.js.publish(subject, encoded[encoded.length - 1]!, { headers });
+      return { lastSequence: ack.seq, count: encoded.length, cursor: cursorOf(identity, ack.seq), eventIds };
     } catch (error) {
+      const full = storeFull(error);
+      if (full !== null) throw full;
       if (/atomic publish is disabled/i.test(asError(error).message)) {
         throw new SyncUsageError(`topic ${config.id}: the stream predates atomic batches (allow_atomic off); recreate it`);
       }
-      // The batch commit error is generic in NATS.js 3.4 — disambiguate a
-      // lost OCC race from real faults by re-reading the subject head.
-      if (expect !== undefined) {
-        const head = await ctx.jsm.streams.getMessage(stream, { last_by_subj: subject }).catch(() => null);
-        const headSeq = head === null ? 0 : head.seq;
-        if (headSeq !== expect.lastSubjectSequence) {
-          throw new ConflictError(
-            `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
-          );
-        }
+      if (expect !== undefined && /wrong last sequence/i.test(asError(error).message)) {
+        throw new ConflictError(
+          `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
+        );
       }
       throw error;
     }
@@ -1211,6 +1268,7 @@ export const createTopic = <T>(
     publishBatch,
     latestCursor,
     head,
+    prune,
     live,
     replay,
     follow,
