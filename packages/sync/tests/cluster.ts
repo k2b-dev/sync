@@ -41,16 +41,26 @@ export const waitForPlacementReady = async (): Promise<void> => {
     // query before that loop even starts.
     const jsm = await jetstreamManager(nc, { checkAPI: false });
     const name = uniqueName("PROBE_R3_READY");
-    for (let i = 0; i < 240; i++) {
-      try {
-        await jsm.streams.add({ name, subjects: [name.toLowerCase()], num_replicas: 3 });
-        await jsm.streams.delete(name);
-        return;
-      } catch {
+    let created = false;
+    try {
+      for (let i = 0; i < 240; i++) {
+        try {
+          if (!created) {
+            await jsm.streams.add({ name, subjects: [name.toLowerCase()], num_replicas: 3 });
+            created = true;
+          }
+          // An accepted assignment alone does not prove that restarted peers
+          // have rejoined. Require both followers to be online and current.
+          const info = await jsm.streams.info(name);
+          const peers = info.cluster?.replicas ?? [];
+          if (peers.length === 2 && peers.every((peer) => peer.current && !peer.offline)) return;
+        } catch {}
         await Bun.sleep(500);
       }
+      throw new Error("cluster did not recover R3 placement in time");
+    } finally {
+      if (created) await jsm.streams.delete(name);
     }
-    throw new Error("cluster did not recover R3 placement in time");
   } finally {
     await nc.close();
   }
