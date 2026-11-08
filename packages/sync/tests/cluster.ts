@@ -36,7 +36,10 @@ export const waitForPlacementReady = async (): Promise<void> => {
   const { jetstreamManager } = await import("@nats-io/jetstream");
   const nc = await connectToCluster({ name: "placement-probe" });
   try {
-    const jsm = await jetstreamManager(nc);
+    // The meta leader may still be electing after a node restart. Let the
+    // existing placement loop probe readiness instead of failing an account
+    // query before that loop even starts.
+    const jsm = await jetstreamManager(nc, { checkAPI: false });
     const name = uniqueName("PROBE_R3_READY");
     for (let i = 0; i < 240; i++) {
       try {
