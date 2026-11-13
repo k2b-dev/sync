@@ -617,9 +617,11 @@ export const createTopic = <T>(
           // Read the head BEFORE the consumer's pending count: every event at
           // or below that head was stored before the count was taken.
           const current = (await ctx.jsm.streams.info(stream)).state;
-          if (proven !== null && current.first_seq > proven + 1) throw gapError(identity, proven + 1, current.first_seq);
-          // Idle means nothing was buffered locally for the whole interval.
+          // A caught-up filtered consumer also covers other tenants' events.
+          // Advance that proof before checking the window: a safe prefix prune
+          // can move first_seq past our last tenant event while we are idle.
           if ((await consumer.info()).num_pending === 0) proven = Math.max(proven ?? 0, current.last_seq);
+          if (proven !== null && current.first_seq > proven + 1) throw gapError(identity, proven + 1, current.first_seq);
           continue;
         }
         if (winner.done === true) return;
