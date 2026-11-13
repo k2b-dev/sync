@@ -504,38 +504,48 @@ describe("sequences and cursor helpers", () => {
     topic.hub().close();
   });
 
-  test("a hub whose follower died is retired: subscribers fail loudly and hub() re-creates it", async () => {
-    const topic = sync.topic<Event>(topicConfig("hub-dead"));
-    const last = await topic.publish({ data: { n: 1 } });
+  test("a hub whose follower fails a broker read retires the run and starts a fresh follower", async () => {
+    const created = Promise.withResolvers<void>();
+    const failure = new Error("broker read failed");
+    let failRead = false;
+    const connection = new Proxy(nc, {
+      get(target, property) {
+        if (property === "request") return async (...args: Parameters<NatsConnection["request"]>) => {
+          if (failRead && args[0].includes(".STREAM.INFO.")) {
+            throw failure;
+          }
+          const reply = await target.request(...args);
+          if (args[0].includes(".CONSUMER.CREATE.")) created.resolve();
+          return reply;
+        };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const peer = createSync({ connection, namespace, application: "tests" });
+    const topic = peer.topic<Event>(topicConfig("hub-dead"));
     const dead = topic.hub();
-    let error: Error | null = null;
-    const run = (async () => {
-      try {
-        for await (const _ of dead.subscribe()) {
-          // live-only; never expected to yield
-        }
-      } catch (err) {
-        error = err as Error;
-      }
-    })();
-    await Bun.sleep(500); // follower is tailing
-    // Retention removes everything the follower is anchored to → RetentionGapError mid-follow.
-    const jsm = await jetstreamManager(nc);
-    for await (const info of jsm.streams.list()) {
-      if (info.config.metadata?.["sync.id"] === "hub-dead" && !info.config.name.includes("D_")) {
-        await jsm.streams.purge(info.config.name, { seq: Number(last.streamSequence) + 100 });
-      }
+    try {
+      await topic.publish({ data: { n: 1 } });
+      const run = collect(dead.subscribe());
+      void run.catch(() => {});
+      await created.promise;
+      // Fail the idle watchdog's next broker read, rather than pretending that
+      // pruning already delivered history loses an event for this follower.
+      failRead = true;
+      await expect(run).rejects.toBe(failure);
+      failRead = false;
+      expect(topic.hub()).toBe(dead);
+      const anchor = await topic.head();
+      const received = collect(dead.subscribe({ after: anchor }), 1);
+      await topic.publish({ data: { n: 2 } });
+      expect((await received).map((e) => e.data.n)).toEqual([2]);
+      dead.close();
+      await expect(collect(dead.subscribe(), 1)).rejects.toBeInstanceOf(SyncUsageError);
+    } finally {
+      dead.close();
+      await peer.drain({ timeoutMs: 5_000 });
     }
-    await run;
-    expect(error).toBeInstanceOf(RetentionGapError);
-    // The hub identity survives; the next subscriber starts a fresh follower.
-    expect(topic.hub()).toBe(dead);
-    const anchor = await topic.head();
-    const received = collect(dead.subscribe({ after: anchor }), 1);
-    await topic.publish({ data: { n: 2 } });
-    expect((await received).map((e) => e.data.n)).toEqual([2]);
-    dead.close();
-    await expect(collect(dead.subscribe(), 1)).rejects.toBeInstanceOf(SyncUsageError); // closed hubs refuse loudly
   }, 30_000);
 });
 
